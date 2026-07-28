@@ -1,20 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-交通費・出張見積もりアプリ（最終統合安定版）
+交通費・出張見積もりアプリ（最終統合・表示一本化版）
 
 機能:
   - Gemini(Web検索)による施設名・住所ジオコーディング
-  - API競合エラーの解消と、国土地理院APIによる二重フェールセーフ（絶対に止まらない構造）
+  - 空港名の確実な抽出・自動推測（「最寄り空港」表記の解消）
   - 離島/遠方の自動判定（NAVITIMEエラー回避）
   - 飛行機を利用する場合はAI運賃に「1.3倍の安全マージン」を適用
-  - UIおよびExcelに「出発駅 ➔ 出発空港 ➔ 到着空港 ➔ 目的地」の詳細ルートを記載
-  - 現地移動（タクシー vs レンタカー 1日12,000円）を比較し最安パターンを出力
+  - 現地移動（タクシー vs レンタカー）を内部で比較し、安い方「だけ」を1つ出力
+  - 試算結果を社内フォーマットのExcelファイル(.xlsx)として自動出力
 """
 
 import json
 import math
 import time
 import io
+import re
 import requests
 from datetime import datetime, timedelta
 import streamlit as st
@@ -66,6 +67,22 @@ def get_active_gemini_model_name():
     except Exception:
         pass
     return "models/gemini-2.5-flash"
+
+
+def guess_airport_from_address(address: str) -> str:
+    """住所から離島の空港名を推測するバックアップ処理"""
+    if "沖永良部" in address or "知名町" in address or "和泊町" in address: return "沖永良部空港"
+    if "奄美" in address or "龍郷町" in address: return "奄美空港"
+    if "徳之島" in address or "伊仙町" in address or "天城町" in address: return "徳之島空港"
+    if "与論" in address: return "与論空港"
+    if "沖縄" in address or "那覇" in address or "宜野湾" in address or "浦添" in address: return "那覇空港"
+    if "石垣" in address: return "新石垣空港"
+    if "宮古" in address: return "宮古空港"
+    if "久米島" in address: return "久米島空港"
+    if "屋久島" in address: return "屋久島空港"
+    if "種子島" in address: return "種子島空港"
+    if "喜界" in address: return "喜界空港"
+    return "最寄り空港"
 
 
 # ============================================================
@@ -202,7 +219,7 @@ def create_excel_report(pattern_data: dict, address: str, headcount: int, work_d
     for col in ws.columns:
         col_letter = get_column_letter(col[0].column)
         if col_letter == 'C':
-            ws.column_dimensions[col_letter].width = 32
+            ws.column_dimensions[col_letter].width = 35
         else:
             max_len = max(len(str(cell.value or '')) for cell in col)
             ws.column_dimensions[col_letter].width = max(max_len + 3, 12)
@@ -231,7 +248,6 @@ def analyze_destination_with_gemini(raw_address: str, api_key: str, origin_name:
     genai.configure(api_key=api_key.strip())
     origin_city = "大阪" if "淀屋橋" in origin_name else "東京"
 
-    # APIの競合を防ぐため、JSONのMIMEタイプ指定を外し、テキストから抽出する
     prompt = f"""
 出張旅費算出のためGoogle検索で調査してください。
 
@@ -243,8 +259,8 @@ def analyze_destination_with_gemini(raw_address: str, api_key: str, origin_name:
   "normalized_address": "対象の正式な住所",
   "dest_lat": 目的地の緯度(数値),
   "dest_lon": 目的地の経度(数値),
-  "is_island_or_remote": 対象が海を渡る完全な離島(沖縄、奄美など)ならtrue。北海道や本州等はfalse,
-  "nearest_airport_name": "最寄り空港名",
+  "is_island_or_remote": 対象が海を渡る完全な離島(沖縄、奄美、沖永良部など)ならtrue。北海道や本州等はfalse,
+  "nearest_airport_name": "最寄り空港名(具体名必須。例:沖永良部空港)",
   "airport_lat": 空港の緯度(数値),
   "airport_lon": 空港の経度(数値),
   "flight_fare_estimate": {origin_city}から最寄り空港への大人片道普通運賃概算(数値),
@@ -257,7 +273,7 @@ def analyze_destination_with_gemini(raw_address: str, api_key: str, origin_name:
     fallback_data = {
         "normalized_address": raw_address,
         "is_island_or_remote": "沖縄" in raw_address or "奄美" in raw_address or "沖永良部" in raw_address,
-        "nearest_airport_name": "最寄り空港",
+        "nearest_airport_name": guess_airport_from_address(raw_address),
         "flight_fare_estimate": 60000,
         "flight_time_min": 180,
         "dest_lat": None, "dest_lon": None,
@@ -269,14 +285,17 @@ def analyze_destination_with_gemini(raw_address: str, api_key: str, origin_name:
         res = model.generate_content(prompt)
         text = res.text
         
-        # テキストからJSON部分だけを安全に抽出
-        start = text.find('{')
-        end = text.rfind('}') + 1
-        if start != -1 and end != 0:
-            parsed_data = json.loads(text[start:end])
+        # 正規表現を使って確実にJSON部分だけを抽出
+        match = re.search(r'\{.*\}', text, re.DOTALL)
+        if match:
+            parsed_data = json.loads(match.group(0))
             fallback_data.update(parsed_data)
     except Exception as e:
         pass
+
+    # JSONから抽出した空港名が未だに「最寄り空港」等のプレースホルダーなら推測名で上書き
+    if fallback_data["nearest_airport_name"] == "最寄り空港" or not fallback_data["nearest_airport_name"]:
+        fallback_data["nearest_airport_name"] = guess_airport_from_address(fallback_data["normalized_address"])
 
     # もしAIが緯度経度を取れなかった場合は、国土地理院APIで二重チェック
     if not fallback_data.get("dest_lat") or not fallback_data.get("dest_lon"):
@@ -343,7 +362,7 @@ def get_navitime_train_route(start_lat, start_lon, goal_lat, goal_lon, api_key: 
 
 
 # ============================================================
-# パターン生成と比較ロジック
+# パターン生成と比較ロジック（結果を一つに絞る）
 # ============================================================
 
 def build_best_route_patterns(st_name: str, ai_info: dict, train_route: dict, headcount: int, work_days: int):
@@ -427,51 +446,57 @@ def build_best_route_patterns(st_name: str, ai_info: dict, train_route: dict, he
     taxi_trips = nights + 1
     taxi_total = round_up_1000(taxi_one_way * 2 * taxi_trips)
 
-    # パターン1: タクシー
+    # タクシーとレンタカーの計算
     b_taxi = {}
+    b_rental = {}
+    
     if selected_mode == "flight":
         b_taxi["航空券費用(往復・人数分)"] = round_up_1000(flight_fare * 2 * headcount)
         b_taxi["最寄り空港アクセス電車運賃(往復・人数分)"] = round_up_1000(access_train_fare * 2 * headcount)
-    else:
-        b_taxi["電車・新幹線運賃(往復・人数分)"] = round_up_1000(train_route["fare"] * 2 * headcount)
-    b_taxi[f"現地タクシー運賃(往復×{taxi_trips}回分)"] = taxi_total
-    b_taxi["宿泊費"] = hotel_cost
-
-    patterns.append({
-        "type": "taxi", "name": f"{route_title_prefix} ＋ 現地タクシー",
-        "time_min": base_time, "cost": sum(b_taxi.values()),
-        "breakdown": b_taxi, "note": stay_note,
-        "taxi_cost": taxi_total, "rental_cost": rental_car_total, 
-        "routes": route_dict, "display_route": display_route_str
-    })
-
-    # パターン2: レンタカー
-    b_rental = {}
-    if selected_mode == "flight":
         b_rental["航空券費用(往復・人数分)"] = round_up_1000(flight_fare * 2 * headcount)
         b_rental["最寄り空港アクセス電車運賃(往復・人数分)"] = round_up_1000(access_train_fare * 2 * headcount)
     else:
+        b_taxi["電車・新幹線運賃(往復・人数分)"] = round_up_1000(train_route["fare"] * 2 * headcount)
         b_rental["電車・新幹線運賃(往復・人数分)"] = round_up_1000(train_route["fare"] * 2 * headcount)
+        
+    b_taxi[f"現地タクシー運賃(往復×{taxi_trips}回分)"] = taxi_total
+    b_taxi["宿泊費"] = hotel_cost
+    taxi_sum = sum(b_taxi.values())
+
     b_rental[f"レンタカー費用(12,000円×{rental_days}日)"] = rental_car_total
     b_rental["宿泊費"] = hotel_cost
+    rental_sum = sum(b_rental.values())
+
+    # 比較して安い方だけを採用する
+    if rental_sum < taxi_sum:
+        diff = taxi_sum - rental_sum
+        recommend_msg = f"🏆 最安ルート (レンタカー利用・タクシーより {diff:,} 円お得)"
+        final_breakdown = b_rental
+        final_cost = rental_sum
+        final_type = "rental"
+        final_name = f"{route_title_prefix} ＋ 現地レンタカー ({rental_days}日間)"
+    else:
+        recommend_msg = "🏆 最安ルート (タクシー利用推奨)"
+        final_breakdown = b_taxi
+        final_cost = taxi_sum
+        final_type = "taxi"
+        final_name = f"{route_title_prefix} ＋ 現地タクシー"
+
+    if selected_mode == "flight":
+        recommend_msg += " / ⚠️ AI相場検索(1.3倍マージン)"
 
     patterns.append({
-        "type": "rental", "name": f"{route_title_prefix} ＋ 現地レンタカー ({rental_days}日間)",
-        "time_min": base_time, "cost": sum(b_rental.values()),
-        "breakdown": b_rental, "note": stay_note,
-        "taxi_cost": taxi_total, "rental_cost": rental_car_total, 
-        "routes": route_dict, "display_route": display_route_str
+        "type": final_type, 
+        "name": final_name,
+        "time_min": base_time, 
+        "cost": final_cost,
+        "breakdown": final_breakdown, 
+        "note": stay_note,
+        "routes": route_dict, 
+        "display_route": display_route_str,
+        "recommend_reason": recommend_msg,
+        "is_recommended": True
     })
-
-    min_p = min(patterns, key=lambda x: x["cost"])
-    for p in patterns:
-        reasons = []
-        p["is_recommended"] = (p == min_p)
-        if p["type"] == "rental" and p["rental_cost"] < p["taxi_cost"]: reasons.append("🚗 レンタカー推奨")
-        elif p["type"] == "taxi" and p["taxi_cost"] <= p["rental_cost"]: reasons.append("🚕 タクシー利用推奨")
-        if selected_mode == "flight": reasons.append("⚠️ AI相場検索(1.3倍マージン)")
-        if p == min_p: reasons.insert(0, "🏆 最安")
-        p["recommend_reason"] = " / ".join(reasons)
 
     return patterns
 
@@ -530,10 +555,11 @@ if st.button("🚀 最速出張見積もりを計算する", type="primary"):
 
         patterns = build_best_route_patterns(st_name, ai_info, train_route, headcount, work_days)
 
+        # 今回は1つ（最安）しか返ってこない
         for p in patterns:
             tag_text = f"⭐ {p['recommend_reason']}"
             with st.expander(f"{p['name']} — 合計 {p['cost']:,} 円  {tag_text}", expanded=p["is_recommended"]):
-                if p["is_recommended"]: st.success(p['recommend_reason'])
+                st.success(p['recommend_reason'])
 
                 st.write(f"🗺️ **詳細ルート:** {p['display_route']}")
                 st.write(f"⏱ **片道所要時間:** 約 {p['time_min']} 分")
