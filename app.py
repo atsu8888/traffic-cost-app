@@ -330,84 +330,119 @@ def get_navitime_fastest_route(start_lat, start_lon, goal_lat, goal_lon, api_key
         "goal": f"{goal_lat},{goal_lon}",
         "start_time": start_time_iso,
         "format": "json",
-        # 出発地/目的地〜最寄り駅間の徒歩距離が2000m以上の場合は車(タクシー等)でのアクセスを許可。
-        # これがないと、離島など「最寄り空港が徒歩圏外」の目的地でルートが繋がらず、
-        # 本土側の新幹線/電車ルートで探索が途切れてしまう。
-        "bound_section": json.dumps({"walk-distance": 2000, "move-type": "car"}),
+        "bound_section": json.dumps({
+            "walk-distance": 2000,
+            "move-type": "car"
+        }),
     }
 
     try:
-        res = requests.get(NAVITIME_URL, headers=headers, params=params, timeout=15)
+        res = requests.get(
+            NAVITIME_URL,
+            headers=headers,
+            params=params,
+            timeout=15
+        )
     except requests.exceptions.RequestException as e:
         st.error(f"❌ NAVITIME 通信エラー: {e}")
         return None
 
+    # ======================================================
+    # デバッグ情報表示
+    # ======================================================
+    with st.expander("🔍 NAVITIME API デバッグ情報", expanded=False):
+
+        st.write("### Request URL")
+        st.code(res.request.url)
+
+        st.write("### Request Parameters")
+        st.json(params)
+
+        st.write("### HTTP Status")
+        st.write(res.status_code)
+
+        st.write("### Response")
+
+        try:
+            st.json(res.json())
+        except Exception:
+            st.code(res.text)
+
     if res.status_code != 200:
         st.error(f"❌ NAVITIME API レスポンスエラー (HTTP {res.status_code})")
-        with st.expander("エラー詳細ログを表示"):
-            st.code(res.text)
         return None
 
     data = res.json()
     items = data.get("items", [])
 
     if not items:
+        st.warning("NAVITIMEからルートが返ってきませんでした。")
         return None
 
-    # 最も所要時間（time）が短いアイテムを選定（最速ルート）
-    fastest_item = min(items, key=lambda x: x.get("summary", {}).get("move", {}).get("time", 99999))
+    # 最も所要時間が短いルートを採用
+    fastest_item = min(
+        items,
+        key=lambda x: x.get("summary", {}).get("move", {}).get("time", 99999)
+    )
 
     summary = fastest_item.get("summary", {})
     move_info = summary.get("move", {})
     time_min = move_info.get("time", 0)
 
-    # 全体合計運賃（NAVITIME算出値）
     total_fare = 0
     if "fare" in move_info and isinstance(move_info["fare"], dict):
-        total_fare = move_info["fare"].get("unit_0", 0) or move_info["fare"].get("total", 0)
+        total_fare = (
+            move_info["fare"].get("unit_0", 0)
+            or move_info["fare"].get("total", 0)
+        )
 
-    # ルート内で飛行機を利用しているか・徒歩時間・運賃・駅名の抽出
     has_flight = False
     flight_fare = 0
     walk_time_min = 0
-    
     end_station_name = "目的地周辺"
 
     sections = fastest_item.get("sections", [])
 
-    # 到着駅/空港の特定
-    # NAVITIME Totalnavi APIのsectionsは [point, move, point, move, ..., point] の順で交互に並び、
-    # type=pointのオブジェクトは "name" を直接持つ（"node"という配列項目は存在しない）。
-    # そのため、徒歩以外の最後のmoveセクションの「直後」のpointセクションのnameを
-    # 到着駅/空港名として採用する（reversed()でsec['node']を探す従来ロジックは常にヒットせず、
-    # 常にフォールバック値の「目的地周辺」になっていた＝空港ルートを検知できない原因）。
+    # デバッグ用：区間一覧
+    with st.expander("🛤 ルート区間一覧", expanded=False):
+        for i, sec in enumerate(sections):
+            st.write(
+                {
+                    "No": i,
+                    "type": sec.get("type"),
+                    "move": sec.get("move"),
+                    "name": sec.get("name"),
+                    "transport": sec.get("transport"),
+                }
+            )
+
+    # 到着駅名取得
     for i, sec in enumerate(sections):
         if sec.get("type") == "move" and sec.get("move") != "walk":
             if i + 1 < len(sections) and sections[i + 1].get("type") == "point":
                 end_station_name = sections[i + 1].get("name", end_station_name)
 
     for sec in sections:
-        m_type = sec.get("move", "")
         sec_type = sec.get("type", "")
+        move_type = sec.get("move", "")
 
-        if sec_type == "move" and m_type == "walk":
+        if sec_type == "move" and move_type == "walk":
             walk_time_min += sec.get("time", 0)
 
-        # 飛行機（NAVITIME公式仕様上のmove値は "domestic_flight"）が含まれるか判定
-        if sec_type == "move" and m_type == "domestic_flight":
+        if sec_type == "move" and move_type == "domestic_flight":
             has_flight = True
-            # 運賃はsec直下の"fare"ではなく、sec["transport"]["fare"]に格納されている
-            # （従来コードはsec["fare"]を参照しており常に存在せず、飛行機運賃を検知できていなかった）
+
             transport = sec.get("transport", {})
-            fare_obj = transport.get("fare", {}) if isinstance(transport, dict) else {}
+            fare_obj = transport.get("fare", {})
+
             if isinstance(fare_obj, dict):
                 flight_fare += fare_obj.get("unit_0", 0) or 0
 
-    # 運賃内訳の整備
     if has_flight:
         if flight_fare == 0:
             flight_fare = int(total_fare * 0.8)
-        access_train_fare = int(total_fare - flight_fare)
+
+        access_train_fare = total_fare - flight_fare
     else:
         flight_fare = 0
         access_train_fare = 0
@@ -419,14 +454,8 @@ def get_navitime_fastest_route(start_lat, start_lon, goal_lat, goal_lon, api_key
         "flight_fare": int(flight_fare),
         "access_train_fare": int(access_train_fare),
         "walk_time_min": walk_time_min,
-        "end_station": end_station_name
+        "end_station": end_station_name,
     }
-
-
-# ============================================================
-# 最速ルートに基づく現地交通手段比較 & 見積もり作成
-# ============================================================
-
 def build_fastest_route_patterns(
     station_name: str,
     station_lat: float,
