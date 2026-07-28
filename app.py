@@ -133,7 +133,7 @@ def create_excel_report(pattern_data: dict, address: str, headcount: int, work_d
     ws["B4"].fill = light_yellow_fill
     ws["B4"].alignment = align_center
 
-    ws["C4"] = f"〒{address}"
+    ws["C4"] = address
     ws["C4"].font = font_title
     ws["C4"].fill = light_yellow_fill
 
@@ -256,13 +256,18 @@ def analyze_and_normalize_with_gemini(raw_address: str, api_key: str) -> dict:
     genai.configure(api_key=api_key.strip())
 
     prompt = f"""
-以下の目的地の住所情報を正規化してください。
+以下の目的地情報を正規化してください。
+郵便番号や施設名・建物名が含まれている場合は絶対に省略せず、それぞれ別項目として保持してください。
+座標(緯度経度)は絶対に含めないでください。
 
-住所入力: {raw_address}
+入力: {raw_address}
 
 以下のJSON形式のみで返答してください。前置きや説明文は不要です。
+該当する情報がない項目は空文字にしてください。
 {{
-  "normalized_address": "鹿児島県大島郡知名町瀬利覚2208"
+  "postal_code": "891-9213",
+  "normalized_address": "鹿児島県大島郡知名町瀬利覚2208",
+  "facility_name": "沖永良部徳洲会病院"
 }}
 """
 
@@ -276,7 +281,7 @@ def analyze_and_normalize_with_gemini(raw_address: str, api_key: str) -> dict:
         )
         return json.loads(res.text)
     except Exception:
-        return {"normalized_address": raw_address}
+        return {"postal_code": "", "normalized_address": raw_address, "facility_name": ""}
 
 
 # ============================================================
@@ -319,6 +324,10 @@ def get_navitime_fastest_route(start_lat, start_lon, goal_lat, goal_lon, api_key
         "goal": f"{goal_lat},{goal_lon}",
         "start_time": start_time_iso,
         "format": "json",
+        # 出発地/目的地〜最寄り駅間の徒歩距離が2000m以上の場合は車(タクシー等)でのアクセスを許可。
+        # これがないと、離島など「最寄り空港が徒歩圏外」の目的地でルートが繋がらず、
+        # 本土側の新幹線/電車ルートで探索が途切れてしまう。
+        "bound_section": json.dumps({"walk-distance": 2000, "move-type": "car"}),
     }
 
     try:
@@ -376,8 +385,8 @@ def get_navitime_fastest_route(start_lat, start_lon, goal_lat, goal_lon, api_key
         if sec_type == "move" and m_type == "walk":
             walk_time_min += sec.get("time", 0)
 
-        # 飛行機（plane / flight / air / airplane）が含まれるか判定
-        if sec_type == "move" and m_type in ["plane", "flight", "air", "airplane", "aeroplane"]:
+        # 飛行機（NAVITIME公式仕様上のmove値は "domestic_flight"）が含まれるか判定
+        if sec_type == "move" and m_type == "domestic_flight":
             has_flight = True
             if "fare" in sec and isinstance(sec["fare"], dict):
                 flight_fare += sec["fare"].get("unit_0", 0)
@@ -570,7 +579,19 @@ if st.button("🚀 最速出張見積もりを計算する（NAVITIME判定）",
         ai_info = analyze_and_normalize_with_gemini(address_input, gemini_api_key)
 
     normalized_address = ai_info.get("normalized_address", address_input)
-    st.success(f"**正規化後の住所:** {normalized_address}")
+    postal_code = ai_info.get("postal_code", "")
+    facility_name = ai_info.get("facility_name", "")
+
+    # Excel等に出力する「正確な目的地」表示用の文字列を組み立てる
+    display_address_parts = []
+    if postal_code:
+        display_address_parts.append(f"〒{postal_code}")
+    display_address_parts.append(normalized_address)
+    if facility_name:
+        display_address_parts.append(f"（{facility_name}）")
+    display_address = " ".join(display_address_parts).replace(" （", "（")
+
+    st.success(f"**正規化後の住所:** {display_address}")
 
     # 2. ジオコーディング
     with st.spinner("📍 国土地理院APIで目的地の位置情報を取得中..."):
@@ -620,7 +641,7 @@ if st.button("🚀 最速出張見積もりを計算する（NAVITIME判定）",
                     st.write(f"　・ {item}: **{amt:,}** 円")
 
                 # Excel出力ボタン
-                excel_bytes = create_excel_report(p, normalized_address, headcount, work_days, st_name, fastest_route['end_station'])
+                excel_bytes = create_excel_report(p, display_address, headcount, work_days, st_name, fastest_route['end_station'])
                 st.download_button(
                     label=f"📥 この最速試算内容でExcel見積書をダウンロード (.xlsx)",
                     data=excel_bytes,
