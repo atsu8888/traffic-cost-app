@@ -296,16 +296,27 @@ def analyze_and_normalize_with_gemini(raw_address: str, api_key: str) -> dict:
 
 def geocode_address(address: str):
     try:
+        st.write("===== ジオコーディング =====")
+        st.write(f"検索文字列: {address}")
+
         res = requests.get(GSI_GEOCODE_URL, params={"q": address}, timeout=10)
         res.raise_for_status()
         data = res.json()
+
+        st.write("検索結果件数:", len(data))
+        st.json(data)
+
         if data:
             lon, lat = data[0]["geometry"]["coordinates"]
-            return lat, lon
-    except Exception:
-        pass
-    return None
 
+            st.success(f"採用座標: {lat}, {lon}")
+
+            return lat, lon
+
+    except Exception as e:
+        st.error(e)
+
+    return None
 
 # ============================================================
 # STEP 3: NAVITIME API から最速ルートを判定・完全計算
