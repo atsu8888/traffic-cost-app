@@ -7,7 +7,7 @@
   - 飛行機の方が速い場合は自動的に「飛行機推奨」判定を行う
   - 費目は社内ルールに従い1,000円単位で切り上げ
   - NAVITIME API (RapidAPI) + Google Gemini API 連携
-  - API環境から利用可能なGeminiモデルを自動検出（404エラー自動回避）
+  - 出発日時(start_time)の自動生成によりNAVITIME 400エラーを解決
 
 必要ライブラリ:
   pip install streamlit google-generativeai requests
@@ -17,6 +17,7 @@ import json
 import math
 import time
 import requests
+from datetime import datetime, timedelta
 import streamlit as st
 import google.generativeai as genai
 
@@ -68,14 +69,12 @@ def haversine_km(lat1, lon1, lat2, lon2):
 def get_active_gemini_model_name():
     """
     お使いのAPIキーで現在呼び出し可能なGeminiモデル名を自動取得する関数。
-    404エラーを100%回避します。
     """
     try:
         models = [
             m.name for m in genai.list_models()
             if "generateContent" in m.supported_generation_methods
         ]
-        # 推奨されるFlashモデルを優先検索
         for target in ["2.5-flash", "2.0-flash", "flash-latest", "1.5-flash"]:
             for name in models:
                 if target in name:
@@ -117,7 +116,6 @@ def analyze_and_normalize_with_gemini(raw_address: str, api_key: str) -> dict:
 }}
 """
 
-    # 自動的に利用可能なモデルを取得
     selected_model_name = get_active_gemini_model_name()
 
     try:
@@ -127,8 +125,7 @@ def analyze_and_normalize_with_gemini(raw_address: str, api_key: str) -> dict:
             generation_config={"response_mime_type": "application/json"},
         )
         return json.loads(res.text)
-    except Exception as e:
-        # 万が一の場合のフェールセーフ
+    except Exception:
         is_island = "沖永良部" in raw_address or "沖縄" in raw_address or "奄美" in raw_address
         return {
             "normalized_address": raw_address,
@@ -169,9 +166,15 @@ def get_navitime_route(start_lat, start_lon, goal_lat, goal_lon, api_key: str):
         "X-RapidAPI-Key": clean_key,
         "X-RapidAPI-Host": NAVITIME_HOST,
     }
+
+    # NAVITIME API必須パラメータ「start_time（出発日時）」を生成（例: 翌日の朝9時）
+    next_day = datetime.now() + timedelta(days=1)
+    start_time_iso = next_day.strftime("%Y-%m-%dT09:00:00")
+
     params = {
         "start": f"{start_lat},{start_lon}",
         "goal": f"{goal_lat},{goal_lon}",
+        "start_time": start_time_iso,
         "format": "json",
     }
 
