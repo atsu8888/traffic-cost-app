@@ -4,6 +4,8 @@
 
 機能:
   - NAVITIME APIの検索結果から「最も所要時間が短い（最速）ルート」を自動選定
+  - NAVITIMEのレスポンスから「到着駅/空港名」を抽出して画面・Excelに反映
+  - 飛行機ルート判定ロジック（NAVITIMEの `plane`, `flight`, `air`, `airplane` に対応）
   - 飛行機ルートの場合もNAVITIME APIの運賃（航空券代＋アクセス電車代）でダイレクト計算
   - 新幹線 vs 飛行機の2パターン並びを廃止し、最速手段のみを1つ選択表示
   - 現地移動（タクシー vs レンタカー 1日12,000円）を比較し最安パターンを出力
@@ -93,7 +95,7 @@ def get_active_gemini_model_name():
 # Excelファイル出力関数（社内フォーマット再現）
 # ============================================================
 
-def create_excel_report(pattern_data: dict, address: str, headcount: int, work_days: int) -> bytes:
+def create_excel_report(pattern_data: dict, address: str, headcount: int, work_days: int, start_st: str, end_st: str) -> bytes:
     """
     試算結果から社内規定レイアウトに基づくExcelファイルを生成してバイナリで返す
     """
@@ -171,15 +173,15 @@ def create_excel_report(pattern_data: dict, address: str, headcount: int, work_d
     breakdown = pattern_data.get("breakdown", {})
 
     items_def = [
-        {"name": "電車・新幹線（往復）", "key": "電車・新幹線運賃", "route": "駅->駅"},
-        {"name": "飛行機（往復）", "key": "航空券費用", "route": "空港->空港"},
-        {"name": "電車・新幹線（往復）", "key": "アクセス電車運賃", "route": "駅->空港"},
-        {"name": "レンタカー", "key": "レンタカー費用", "route": "現地周遊/目的地移動"},
-        {"name": "タクシー（往復）", "key": "タクシー運賃", "route": "空港/駅↔目的地"},
+        {"name": "電車・新幹線（往復）", "key": "電車・新幹線運賃", "route": f"{start_st} ➔ {end_st}"},
+        {"name": "飛行機（往復）", "key": "航空券費用", "route": f"{start_st} ➔ {end_st}"},
+        {"name": "電車・新幹線（往復）", "key": "アクセス電車運賃", "route": "駅 ➔ 空港"},
+        {"name": "レンタカー", "key": "レンタカー費用", "route": f"{end_st} ➔ 目的地周遊"},
+        {"name": "タクシー（往復）", "key": "タクシー運賃", "route": f"{end_st} ↔ 目的地"},
         {"name": "宿泊", "key": "宿泊費", "route": ""},
     ]
 
-    time_hours = round(pattern_data.get("time_min", 0) / 60.0)
+    time_hours = round(pattern_data.get("time_min", 0) / 60.0, 1)
 
     for item in items_def:
         amount = 0
@@ -193,7 +195,7 @@ def create_excel_report(pattern_data: dict, address: str, headcount: int, work_d
 
         ws.cell(row=row_idx, column=1, value=chk_mark).alignment = align_center
         ws.cell(row=row_idx, column=2, value=item["name"]).alignment = align_left
-        ws.cell(row=row_idx, column=3, value=item["route"]).alignment = align_left
+        ws.cell(row=row_idx, column=3, value=item["route"] if is_checked else "-").alignment = align_left
         ws.cell(row=row_idx, column=4, value=amount).number_format = '#,##0'
         ws.cell(row=row_idx, column=5, value=amount).number_format = '#,##0'
         
@@ -239,7 +241,7 @@ def create_excel_report(pattern_data: dict, address: str, headcount: int, work_d
     for col in ws.columns:
         max_len = max(len(str(cell.value or '')) for cell in col)
         col_letter = get_column_letter(col[0].column)
-        ws.column_dimensions[col_letter].width = max(max_len + 3, 12)
+        ws.column_dimensions[col_letter].width = max(max_len + 3, 15)
 
     output = io.BytesIO()
     wb.save(output)
@@ -301,7 +303,7 @@ def geocode_address(address: str):
 def get_navitime_fastest_route(start_lat, start_lon, goal_lat, goal_lon, api_key: str):
     """
     NAVITIME Totalnavi APIから全ルート候補を取得し、
-    最も所要時間が短い（最速の）ルートを自動選定して、その詳細運賃を全計算して返す。
+    最も所要時間が短い（最速の）ルートを自動選定して、その詳細運賃・駅名を抽出して返す。
     """
     clean_key = api_key.strip()
     headers = {
@@ -349,12 +351,24 @@ def get_navitime_fastest_route(start_lat, start_lon, goal_lat, goal_lon, api_key
     if "fare" in move_info and isinstance(move_info["fare"], dict):
         total_fare = move_info["fare"].get("unit_0", 0) or move_info["fare"].get("total", 0)
 
-    # ルート内で飛行機を利用しているか・徒歩時間・運賃の内訳を分析
+    # ルート内で飛行機を利用しているか・徒歩時間・運賃・駅名の抽出
     has_flight = False
     flight_fare = 0
     walk_time_min = 0
+    
+    end_station_name = "目的地周辺"
 
     sections = fastest_item.get("sections", [])
+    
+    # 到着駅/空港の特定 (最後の移動手段の到着地点)
+    for i in reversed(range(len(sections))):
+        sec = sections[i]
+        if sec.get("type") == "move" and sec.get("move") != "walk":
+            if "node" in sec and isinstance(sec["node"], list) and len(sec["node"]) > 1:
+                end_node = sec["node"][-1]
+                end_station_name = end_node.get("name", "目的地周辺")
+            break
+
     for sec in sections:
         m_type = sec.get("move", "")
         sec_type = sec.get("type", "")
@@ -362,8 +376,8 @@ def get_navitime_fastest_route(start_lat, start_lon, goal_lat, goal_lon, api_key
         if sec_type == "move" and m_type == "walk":
             walk_time_min += sec.get("time", 0)
 
-        # 飛行機（plane / flight）が含まれるか判定
-        if sec_type == "move" and (m_type == "plane" or m_type == "flight"):
+        # 飛行機（plane / flight / air / airplane）が含まれるか判定
+        if sec_type == "move" and m_type in ["plane", "flight", "air", "airplane", "aeroplane"]:
             has_flight = True
             if "fare" in sec and isinstance(sec["fare"], dict):
                 flight_fare += sec["fare"].get("unit_0", 0)
@@ -384,6 +398,7 @@ def get_navitime_fastest_route(start_lat, start_lon, goal_lat, goal_lon, api_key
         "flight_fare": int(flight_fare),
         "access_train_fare": int(access_train_fare),
         "walk_time_min": walk_time_min,
+        "end_station": end_station_name
     }
 
 
@@ -398,23 +413,21 @@ def build_fastest_route_patterns(
     dest_lat: float,
     dest_lon: float,
     fastest_route: dict,
-    address_str: str,
     headcount: int,
     work_days: int,
 ):
     """
-    NAVITIME選定の最速ルート（新幹線 or 飛行機）をベースにし、
+    NAVITIME選定の最速ルートをベースにし、
     現地「タクシー」と「レンタカー」の2パターンのみを作成・比較
     """
     patterns = []
     has_flight = fastest_route["has_flight"]
     time_min = fastest_route["time_min"]
     travel_hours = time_min / 60.0
-
-    is_island = "沖永良部" in address_str or "沖縄" in address_str or "奄美" in address_str
+    end_st = fastest_route.get("end_station", "目的地最寄り")
 
     # 前泊・宿泊日数判定
-    if has_flight or is_island or travel_hours >= 4.0:
+    if has_flight or travel_hours >= 4.0:
         nights = work_days + 1
         stay_note = f"移動時間（約{travel_hours:.1f}h）または飛行機利用のため、前泊/後泊想定（{nights}泊）"
     elif travel_hours >= 2.5:
@@ -431,12 +444,12 @@ def build_fastest_route_patterns(
         flight_rt_total = round_up_1000(fastest_route["flight_fare"] * 2 * headcount)
         access_train_rt = round_up_1000(fastest_route["access_train_fare"] * 2 * headcount)
         train_rt = 0
-        route_title_prefix = "✈️ 飛行機最速ルート"
+        route_title_prefix = f"✈️ {end_st}着 飛行機ルート"
     else:
         flight_rt_total = 0
         access_train_rt = 0
         train_rt = round_up_1000(fastest_route["total_fare"] * 2 * headcount)
-        route_title_prefix = "🚄 新幹線/電車最速ルート"
+        route_title_prefix = f"🚄 {end_st}着 新幹線/電車ルート"
 
     # 現地移動費用（タクシー vs レンタカー 1日12,000円）
     rental_days = work_days + (1 if "前泊" in stay_note else 0)
@@ -585,10 +598,10 @@ if st.button("🚀 最速出張見積もりを計算する（NAVITIME判定）",
             continue
 
         patterns, has_flight = build_fastest_route_patterns(
-            st_name, st_lat, st_lon, dest_lat, dest_lon, fastest_route, normalized_address, headcount, work_days
+            st_name, st_lat, st_lon, dest_lat, dest_lon, fastest_route, headcount, work_days
         )
 
-        transport_label = "✈️ 飛行機ルート" if has_flight else "🚄 新幹線/電車ルート"
+        transport_label = f"✈️ 飛行機ルート（到着: {fastest_route['end_station']}）" if has_flight else f"🚄 新幹線/電車ルート（到着: {fastest_route['end_station']}）"
         st.info(f"💡 **【NAVITIME 最速判定結果】** この目的地への最速交通手段は **{transport_label}** （片道約 {fastest_route['time_min']} 分）です。")
 
         for p in patterns:
@@ -598,6 +611,7 @@ if st.button("🚀 最速出張見積もりを計算する（NAVITIME判定）",
                 if p["is_recommended"]:
                     st.success(f"推奨パターン: {p['recommend_reason']}")
 
+                st.write(f"🚉 **到着駅/空港:** {fastest_route['end_station']}")
                 st.write(f"⏱ **片道所要時間（NAVITIME算出）:** 約 {p['time_min']} 分")
                 st.write(f"🏨 **出張宿泊条件:** {p['note']}")
                 st.write("**💰 費目別内訳（1,000円単位切り上げ済み）:**")
@@ -606,7 +620,7 @@ if st.button("🚀 最速出張見積もりを計算する（NAVITIME判定）",
                     st.write(f"　・ {item}: **{amt:,}** 円")
 
                 # Excel出力ボタン
-                excel_bytes = create_excel_report(p, normalized_address, headcount, work_days)
+                excel_bytes = create_excel_report(p, normalized_address, headcount, work_days, st_name, fastest_route['end_station'])
                 st.download_button(
                     label=f"📥 この最速試算内容でExcel見積書をダウンロード (.xlsx)",
                     data=excel_bytes,
@@ -616,4 +630,5 @@ if st.button("🚀 最速出張見積もりを計算する（NAVITIME判定）",
                 )
 
         st.markdown("---")
+
 
