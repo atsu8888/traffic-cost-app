@@ -16,6 +16,7 @@
 
 import json
 import math
+import time
 import requests
 import streamlit as st
 import google.generativeai as genai
@@ -37,8 +38,8 @@ TAXI_WALK_THRESHOLD_MIN = 15               # 最寄駅から徒歩何分以上�
 TAXI_FARE_PER_KM = 400  # 円/km（初乗り+距離想定の簡易単価。地域により要調整）
 
 GEMINI_MODEL_NAME = "models/gemini-flash-latest"
-NAVITIME_URL = "https://navitime-route-totalnav.p.rapidapi.com/route_transit"
-NAVITIME_HOST = "navitime-route-totalnav.p.rapidapi.com"
+NAVITIME_URL = "https://navitime-route-totalnavi.p.rapidapi.com/route_transit"
+NAVITIME_HOST = "navitime-route-totalnavi.p.rapidapi.com"
 GSI_GEOCODE_URL = "https://msearch.gsi.go.jp/address-search/AddressSearch"
 
 
@@ -116,6 +117,22 @@ def get_navitime_route(start_lat, start_lon, goal_lat, goal_lon, api_key: str):
         res = requests.get(NAVITIME_URL, headers=headers, params=params, timeout=15)
     except requests.exceptions.RequestException as e:
         st.error(f"NAVITIME 通信エラー: {e}")
+        return None
+
+    if res.status_code == 429:
+        st.error(
+            "NAVITIME API エラー: 429 (レート制限)。"
+            "短時間に連続でリクエストしすぎている可能性があります。"
+            "RapidAPIのプランの秒間/月間リクエスト上限をご確認ください。"
+        )
+        return None
+
+    if res.status_code == 404:
+        st.error(
+            "NAVITIME API エラー: 404 (エンドポイントが見つかりません)。"
+            "RapidAPIダッシュボードで、契約中のプランにこのエンドポイント"
+            f"({NAVITIME_URL}) が含まれているか、パスが正しいかご確認ください。"
+        )
         return None
 
     if res.status_code != 200:
@@ -261,6 +278,18 @@ address_input = st.text_input("目的地住所", "広島県広島市中区中島
 headcount = st.number_input("人数", min_value=1, value=2)
 nights = st.number_input("宿泊日数", min_value=0, value=4)
 
+station_choice = st.radio(
+    "出発駅",
+    options=["大宮駅", "淀屋橋駅", "両方比較(NAVITIME呼び出し2回分)"],
+    horizontal=True,
+)
+st.caption("※ NAVITIMEを無料プランで利用中の場合、呼び出し回数の上限にご注意ください。")
+
+if station_choice == "両方比較(NAVITIME呼び出し2回分)":
+    stations_to_query = STATION_COORDS
+else:
+    stations_to_query = {station_choice: STATION_COORDS[station_choice]}
+
 if st.button("見積もりを試算する"):
 
     # --- STEP 1: 住所正規化 ---
@@ -291,7 +320,11 @@ if st.button("見積もりを試算する"):
     st.subheader("③ 出発駅ごとの経路・運賃")
 
     results = {}
-    for station_name, (s_lat, s_lon) in STATION_COORDS.items():
+    for i, (station_name, (s_lat, s_lon)) in enumerate(stations_to_query.items()):
+        if i > 0:
+            # レート制限(429)対策として、連続呼び出しの間に間隔を空ける
+            time.sleep(1.5)
+
         with st.spinner(f"{station_name}からの経路を計算中..."):
             route_info = get_navitime_route(s_lat, s_lon, dest_lat, dest_lon, navitime_api_key)
 
