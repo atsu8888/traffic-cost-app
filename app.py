@@ -95,7 +95,7 @@ def get_active_gemini_model_name():
 # Excelファイル出力関数（社内フォーマット再現）
 # ============================================================
 
-def create_excel_report(pattern_data: dict, address: str, headcount: int, work_days: int, start_st: str, end_st: str) -> bytes:
+def create_excel_report(pattern_data: dict, address: str, headcount: int, work_days: int, start_st: str, end_st: str, destination_label: str = None) -> bytes:
     """
     試算結果から社内規定レイアウトに基づくExcelファイルを生成してバイナリで返す
     """
@@ -172,12 +172,18 @@ def create_excel_report(pattern_data: dict, address: str, headcount: int, work_d
     total_sum = 0
     breakdown = pattern_data.get("breakdown", {})
 
+    # 経路列に表示する目的地名。呼び出し元から施設名/正規化住所が渡されればそれを使い、
+    # 未指定の場合のみ住所欄(address)全文を使う。
+    # （従来は「目的地」という固定文字列がそのまま入っており、例えば「淀屋橋 ➔ 目的地」のように
+    # 実際の目的地名が一切反映されない表記になっていた）
+    dest_label = destination_label or address or "目的地"
+
     items_def = [
-        {"name": "電車・新幹線（往復）", "key": "電車・新幹線運賃", "route": f"{start_st} ➔ {end_st}"},
+        {"name": "電車・新幹線（往復）", "key": "電車・新幹線運賃", "route": f"{start_st} ➔ {dest_label}"},
         {"name": "飛行機（往復）", "key": "航空券費用", "route": f"{start_st} ➔ {end_st}"},
-        {"name": "電車・新幹線（往復）", "key": "アクセス電車運賃", "route": "駅 ➔ 空港"},
-        {"name": "レンタカー", "key": "レンタカー費用", "route": f"{end_st} ➔ 目的地周遊"},
-        {"name": "タクシー（往復）", "key": "タクシー運賃", "route": f"{end_st} ↔ 目的地"},
+        {"name": "電車・新幹線（往復）", "key": "アクセス電車運賃", "route": f"{end_st} ➔ {dest_label}"},
+        {"name": "レンタカー", "key": "レンタカー費用", "route": f"{end_st} ➔ {dest_label}（周遊）"},
+        {"name": "タクシー（往復）", "key": "タクシー運賃", "route": f"{end_st} ↔ {dest_label}"},
         {"name": "宿泊", "key": "宿泊費", "route": ""},
     ]
 
@@ -368,15 +374,17 @@ def get_navitime_fastest_route(start_lat, start_lon, goal_lat, goal_lon, api_key
     end_station_name = "目的地周辺"
 
     sections = fastest_item.get("sections", [])
-    
-    # 到着駅/空港の特定 (最後の移動手段の到着地点)
-    for i in reversed(range(len(sections))):
-        sec = sections[i]
+
+    # 到着駅/空港の特定
+    # NAVITIME Totalnavi APIのsectionsは [point, move, point, move, ..., point] の順で交互に並び、
+    # type=pointのオブジェクトは "name" を直接持つ（"node"という配列項目は存在しない）。
+    # そのため、徒歩以外の最後のmoveセクションの「直後」のpointセクションのnameを
+    # 到着駅/空港名として採用する（reversed()でsec['node']を探す従来ロジックは常にヒットせず、
+    # 常にフォールバック値の「目的地周辺」になっていた＝空港ルートを検知できない原因）。
+    for i, sec in enumerate(sections):
         if sec.get("type") == "move" and sec.get("move") != "walk":
-            if "node" in sec and isinstance(sec["node"], list) and len(sec["node"]) > 1:
-                end_node = sec["node"][-1]
-                end_station_name = end_node.get("name", "目的地周辺")
-            break
+            if i + 1 < len(sections) and sections[i + 1].get("type") == "point":
+                end_station_name = sections[i + 1].get("name", end_station_name)
 
     for sec in sections:
         m_type = sec.get("move", "")
@@ -388,8 +396,12 @@ def get_navitime_fastest_route(start_lat, start_lon, goal_lat, goal_lon, api_key
         # 飛行機（NAVITIME公式仕様上のmove値は "domestic_flight"）が含まれるか判定
         if sec_type == "move" and m_type == "domestic_flight":
             has_flight = True
-            if "fare" in sec and isinstance(sec["fare"], dict):
-                flight_fare += sec["fare"].get("unit_0", 0)
+            # 運賃はsec直下の"fare"ではなく、sec["transport"]["fare"]に格納されている
+            # （従来コードはsec["fare"]を参照しており常に存在せず、飛行機運賃を検知できていなかった）
+            transport = sec.get("transport", {})
+            fare_obj = transport.get("fare", {}) if isinstance(transport, dict) else {}
+            if isinstance(fare_obj, dict):
+                flight_fare += fare_obj.get("unit_0", 0) or 0
 
     # 運賃内訳の整備
     if has_flight:
@@ -464,10 +476,17 @@ def build_fastest_route_patterns(
     rental_days = work_days + (1 if "前泊" in stay_note else 0)
     rental_car_total = round_up_1000(RENTAL_CAR_COST_PER_DAY * rental_days)
 
-    est_taxi_km = max(fastest_route["walk_time_min"] * 0.08, 15.0 if has_flight else 2.0)
-    taxi_one_way = est_taxi_km * TAXI_FARE_PER_KM
+    # 最寄り駅/空港から目的地までの徒歩時間がTAXI_WALK_THRESHOLD_MIN以下なら、
+    # 徒歩圏内とみなしタクシー費用は計上しない（従来はこの定数が定義されているだけで
+    # 一切参照されておらず、どんなに近くても最低区間分のタクシー代が必ず計上されていた）。
     taxi_trips = nights + 1
-    taxi_total = round_up_1000(taxi_one_way * 2 * taxi_trips)
+    if fastest_route["walk_time_min"] <= TAXI_WALK_THRESHOLD_MIN:
+        est_taxi_km = 0.0
+        taxi_total = 0
+    else:
+        est_taxi_km = max(fastest_route["walk_time_min"] * 0.08, 15.0 if has_flight else 2.0)
+        taxi_one_way = est_taxi_km * TAXI_FARE_PER_KM
+        taxi_total = round_up_1000(taxi_one_way * 2 * taxi_trips)
 
     # 1. 最速ルート ＋ タクシー利用
     breakdown_taxi = {}
@@ -641,7 +660,12 @@ if st.button("🚀 最速出張見積もりを計算する（NAVITIME判定）",
                     st.write(f"　・ {item}: **{amt:,}** 円")
 
                 # Excel出力ボタン
-                excel_bytes = create_excel_report(p, display_address, headcount, work_days, st_name, fastest_route['end_station'])
+                # 経路欄に出す目的地名は、施設名があればそれを優先し、なければ正規化住所を使う
+                dest_label_for_excel = facility_name or normalized_address
+                excel_bytes = create_excel_report(
+                    p, display_address, headcount, work_days, st_name, fastest_route['end_station'],
+                    destination_label=dest_label_for_excel,
+                )
                 st.download_button(
                     label=f"📥 この最速試算内容でExcel見積書をダウンロード (.xlsx)",
                     data=excel_bytes,
