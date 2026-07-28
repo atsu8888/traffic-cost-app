@@ -141,9 +141,8 @@ def create_excel_report(pattern_data: dict, address: str, headcount: int, work_d
     row_idx = 11
     total_sum = 0
     breakdown = pattern_data.get("breakdown", {})
-    routes = pattern_data.get("routes", {})  # 詳細ルート情報を取得
+    routes = pattern_data.get("routes", {})
 
-    # Excelの各行に対応する費目と経路の定義
     items_def = [
         {"name": "電車・新幹線（往復）", "key": "電車・新幹線運賃", "route": routes.get("train", "-")},
         {"name": "飛行機（往復）", "key": "航空券費用", "route": routes.get("flight", "-")},
@@ -243,7 +242,7 @@ def analyze_destination_with_gemini(raw_address: str, api_key: str, origin_name:
 4. 出発拠点から最寄り空港までの「大人片道普通運賃（ANA/JAL）」の概算額を検索してください。
 5. 出発空港から到着空港までの「片道の飛行時間（分）」を特定してください。
 
-以下のJSON形式のみで出力してください（Markdownの```jsonなどは含めないでください）。
+以下のJSON形式のみで出力してください。
 {{
   "normalized_address": "鹿児島県大島郡知名町瀬利覚2208",
   "dest_lat": 27.3821,
@@ -261,7 +260,320 @@ def analyze_destination_with_gemini(raw_address: str, api_key: str, origin_name:
         model = genai.GenerativeModel(model_name, tools=[{"google_search": {}}])
         res = model.generate_content(prompt, generation_config={"response_mime_type": "application/json"})
         
+        # SyntaxError対策：安全に余分なマークダウン記号を除去
         text = res.text.strip()
-        if text.startswith("
+        text = text.replace('```json', '')
+        text = text.replace('```', '')
+        text = text.strip()
+            
+        return json.loads(text)
+    except Exception as e:
+        return None
+
+
+# ============================================================
+# STEP 2: NAVITIME API (純粋な「陸路」専用検索)
+# ============================================================
+
+def get_navitime_train_route(start_lat, start_lon, goal_lat, goal_lon, api_key: str):
+    clean_key = api_key.strip()
+    headers = {
+        "X-RapidAPI-Key": clean_key,
+        "X-RapidAPI-Host": NAVITIME_HOST,
+    }
+    next_day = datetime.now() + timedelta(days=1)
+    start_time_iso = next_day.strftime("%Y-%m-%dT09:00:00")
+
+    params = {
+        "start": f"{start_lat},{start_lon}",
+        "goal": f"{goal_lat},{goal_lon}",
+        "start_time": start_time_iso,
+        "format": "json",
+        "airplane": 0  # 飛行機ルートを排除（陸路の最速を探すため）
+    }
+
+    try:
+        res = requests.get(NAVITIME_URL, headers=headers, params=params, timeout=15)
+        if res.status_code != 200:
+            return None
+    except:
+        return None
+
+    data = res.json()
+    items = data.get("items", [])
+    if not items:
+        return None
+
+    fastest_item = min(items, key=lambda x: x.get("summary", {}).get("move", {}).get("time", 99999))
+    summary = fastest_item.get("summary", {})
+    move_info = summary.get("move", {})
+    time_min = move_info.get("time", 0)
+
+    total_fare = 0
+    if "fare" in move_info and isinstance(move_info["fare"], dict):
+        total_fare = move_info["fare"].get("unit_0", 0) or move_info["fare"].get("total", 0)
+
+    walk_time_min = 0
+    end_station_name = "最寄り駅"
+
+    sections = fastest_item.get("sections", [])
+    for i in reversed(range(len(sections))):
+        sec = sections[i]
+        if sec.get("type") == "move" and sec.get("move") not in ["walk", "car", "taxi"]:
+            if i + 1 < len(sections):
+                next_sec = sections[i + 1]
+                if next_sec.get("type") == "point":
+                    name = next_sec.get("name", "")
+                    if name:
+                        end_station_name = name
+            break
+
+    for sec in sections:
+        if sec.get("type") == "move" and sec.get("move") == "walk":
+            walk_time_min += sec.get("time", 0)
+
+    return {
+        "time_min": time_min,
+        "fare": int(total_fare),
+        "walk_time_min": walk_time_min,
+        "end_station": end_station_name
+    }
+
+
+# ============================================================
+# パターン生成と比較ロジック
+# ============================================================
+
+def build_best_route_patterns(
+    st_name: str,
+    ai_info: dict,
+    train_route: dict,
+    headcount: int,
+    work_days: int
+):
+    patterns = []
+    is_island = ai_info.get("is_island_or_remote", False)
+    
+    # --- ✈️ 飛行機ルートのパラメータ構築 ---
+    airport_name = ai_info.get("nearest_airport_name", "最寄り空港")
+    airport_lat = ai_info.get("airport_lat", 0)
+    airport_lon = ai_info.get("airport_lon", 0)
+    dest_lat = ai_info.get("dest_lat", 0)
+    dest_lon = ai_info.get("dest_lon", 0)
+    
+    airport_to_dest_km = haversine_km(airport_lat, airport_lon, dest_lat, dest_lon)
+    if airport_to_dest_km < 1.0: airport_to_dest_km = 15.0
+    
+    flight_time_total = int(60 + ai_info.get("flight_time_min", 150) + (airport_to_dest_km / 40.0 * 60))
+    
+    # 💡 AI(Web検索)運賃は安全マージン1.3倍を掛ける
+    raw_flight_fare = ai_info.get("flight_fare_estimate", 60000)
+    flight_fare = int(raw_flight_fare * 1.3)
+    
+    origin_airport = "伊丹空港" if "淀屋橋" in st_name else "羽田空港"
+    access_train_fare = 1500 if "大宮" in st_name else 500
+    
+    # 飛行機用の詳細ルート設定
+    flight_routes = {
+        "train": "-",
+        "flight": f"{origin_airport} ➔ {airport_name}",
+        "access": f"{st_name} ➔ {origin_airport}",
+        "taxi": f"{airport_name} ↔ 目的地",
+        "rental": f"{airport_name} ➔ 目的地周辺"
+    }
+    
+    # --- 🚄 新幹線ルートのパラメータ構築 ---
+    train_time_total = train_route["time_min"] if train_route else 99999
+    
+    # 新幹線用の詳細ルート設定
+    if train_route:
+        end_st = train_route["end_station"]
+        train_routes = {
+            "train": f"{st_name} ➔ {end_st}",
+            "flight": "-",
+            "access": "-",
+            "taxi": f"{end_st} ↔ 目的地",
+            "rental": f"{end_st} ➔ 目的地周辺"
+        }
+    else:
+        end_st = "最寄り駅"
+        train_routes = {}
+    
+    # --- 最速判定 ---
+    if is_island or (flight_time_total < train_time_total):
+        selected_mode = "flight"
+        base_time = flight_time_total
+        route_dict = flight_routes
+        base_taxi_km = airport_to_dest_km
+        route_title_prefix = f"✈️ 飛行機最速ルート ({airport_name}利用)"
+        display_route_str = f"{st_name} ➔ {origin_airport} ➔ {airport_name} ➔ 目的地"
+    else:
+        selected_mode = "train"
+        base_time = train_time_total
+        route_dict = train_routes
+        base_taxi_km = max(train_route["walk_time_min"] * 0.08, 1.5)
+        route_title_prefix = f"🚄 新幹線/電車最速ルート ({end_st}着)"
+        display_route_str = f"{st_name} ➔ {end_st} ➔ 目的地"
+        
+    travel_hours = base_time / 60.0
+
+    # 宿泊判定
+    if selected_mode == "flight" or travel_hours >= 4.0:
+        nights = work_days + 1
+        stay_note = f"移動時間や飛行機利用のため、前泊/後泊想定（{nights}泊）"
+    elif travel_hours >= 2.5:
+        nights = work_days
+        stay_note = f"移動2.5時間以上の為宿泊想定（{nights}泊）"
+    else:
+        nights = max(work_days - 1, 0)
+        stay_note = f"日帰り/標準宿泊（{nights}泊）"
+
+    hotel_cost = round_up_1000(HOTEL_COST_PER_NIGHT_PER_PERSON * headcount * nights)
+    rental_days = work_days + (1 if "前泊" in stay_note else 0)
+    rental_car_total = round_up_1000(RENTAL_CAR_COST_PER_DAY * rental_days)
+
+    taxi_one_way = base_taxi_km * TAXI_FARE_PER_KM
+    taxi_trips = nights + 1
+    taxi_total = round_up_1000(taxi_one_way * 2 * taxi_trips)
+
+    # パターン1: タクシー利用
+    b_taxi = {}
+    if selected_mode == "flight":
+        b_taxi["航空券費用(往復・人数分)"] = round_up_1000(flight_fare * 2 * headcount)
+        b_taxi["最寄り空港アクセス電車運賃(往復・人数分)"] = round_up_1000(access_train_fare * 2 * headcount)
+    else:
+        b_taxi["電車・新幹線運賃(往復・人数分)"] = round_up_1000(train_route["fare"] * 2 * headcount)
+    b_taxi[f"現地タクシー運賃(往復×{taxi_trips}回分)"] = taxi_total
+    b_taxi["宿泊費"] = hotel_cost
+
+    patterns.append({
+        "type": "taxi", "name": f"{route_title_prefix} ＋ 現地タクシー",
+        "time_min": base_time, "cost": sum(b_taxi.values()),
+        "breakdown": b_taxi, "note": stay_note,
+        "taxi_cost": taxi_total, "rental_cost": rental_car_total, 
+        "routes": route_dict, "display_route": display_route_str
+    })
+
+    # パターン2: レンタカー利用
+    b_rental = {}
+    if selected_mode == "flight":
+        b_rental["航空券費用(往復・人数分)"] = round_up_1000(flight_fare * 2 * headcount)
+        b_rental["最寄り空港アクセス電車運賃(往復・人数分)"] = round_up_1000(access_train_fare * 2 * headcount)
+    else:
+        b_rental["電車・新幹線運賃(往復・人数分)"] = round_up_1000(train_route["fare"] * 2 * headcount)
+    b_rental[f"レンタカー費用(12,000円×{rental_days}日)"] = rental_car_total
+    b_rental["宿泊費"] = hotel_cost
+
+    patterns.append({
+        "type": "rental", "name": f"{route_title_prefix} ＋ 現地レンタカー ({rental_days}日間)",
+        "time_min": base_time, "cost": sum(b_rental.values()),
+        "breakdown": b_rental, "note": stay_note,
+        "taxi_cost": taxi_total, "rental_cost": rental_car_total, 
+        "routes": route_dict, "display_route": display_route_str
+    })
+
+    min_p = min(patterns, key=lambda x: x["cost"])
+    for p in patterns:
+        reasons = []
+        p["is_recommended"] = (p == min_p)
+
+        if p["type"] == "rental" and p["rental_cost"] < p["taxi_cost"]:
+            diff = p["taxi_cost"] - p["rental_cost"]
+            reasons.append(f"🚗 レンタカー推奨（タクシーより {diff:,} 円お得）")
+        elif p["type"] == "taxi" and p["taxi_cost"] <= p["rental_cost"]:
+            reasons.append("🚕 タクシー利用推奨")
+
+        if selected_mode == "flight":
+            reasons.append("⚠️ AI検索概算適用 (運賃1.3倍安全マージン)")
+
+        if p == min_p:
+            reasons.insert(0, "🏆 最安")
+
+        p["recommend_reason"] = " / ".join(reasons)
+
+    return patterns
+
+
+# ============================================================
+# Streamlit UI
+# ============================================================
+
+st.set_page_config(page_title="交通費・出張見積もりアプリ", page_icon="🚗", layout="wide")
+st.title("🚗 交通費・出張見積もりアプリ")
+
+st.sidebar.header("🔑 APIキー設定")
+gemini_api_key = st.sidebar.text_input("Gemini API Key", type="password")
+navitime_api_key = st.sidebar.text_input("NAVITIME API Key (RapidAPI)", type="password")
+
+if not gemini_api_key or not navitime_api_key:
+    st.info("👈 サイドバーから Gemini API Key と NAVITIME API Key を入力してください。")
+    st.stop()
+
+col1, col2 = st.columns([2, 1])
+with col1:
+    address_input = st.text_input("目的地（住所や施設名）", "鹿児島県大島郡知名町瀬利覚2208（沖永良部徳洲会病院）")
+with col2:
+    station_choice = st.selectbox("出発拠点", ["淀屋橋駅", "大宮駅", "両方比較"], index=0)
+
+col_a, col_b = st.columns(2)
+with col_a:
+    headcount = st.number_input("作業人数（人）", min_value=1, value=1)
+with col_b:
+    work_days = st.number_input("現地作業日数（日）", min_value=1, value=2)
+
+st.markdown("---")
+
+if st.button("🚀 最速出張見積もりを計算する", type="primary"):
+
+    stations = STATION_COORDS if station_choice == "両方比較" else {station_choice: STATION_COORDS[station_choice]}
+
+    for st_name, (st_lat, st_lon) in stations.items():
+        st.markdown(f"### 🚉 出発地: 【{st_name}】")
+
+        with st.spinner(f"🤖 AIが {address_input} を検索・分析中..."):
+            ai_info = analyze_destination_with_gemini(address_input, gemini_api_key, st_name)
+            
+        if not ai_info:
+            st.error("目的地情報の取得に失敗しました。")
+            continue
+
+        normalized_address = ai_info.get("normalized_address", address_input)
+        dest_lat = ai_info.get("dest_lat")
+        dest_lon = ai_info.get("dest_lon")
+        is_island = ai_info.get("is_island_or_remote", False)
+
+        st.success(f"**📍 検索地点:** {normalized_address}")
+        
+        train_route = None
+        if is_island:
+            st.info("💡 **海を渡る離島・遠隔地と判定されました。NAVITIME検索をスキップし、飛行機ルートを適用します。**")
+        else:
+            with st.spinner(f"🧭 陸路の最速ルートをNAVITIMEで検索中..."):
+                train_route = get_navitime_train_route(st_lat, st_lon, dest_lat, dest_lon, navitime_api_key)
+
+        patterns = build_best_route_patterns(st_name, ai_info, train_route, headcount, work_days)
+
+        for p in patterns:
+            tag_text = f"⭐ {p['recommend_reason']}"
+            with st.expander(f"{p['name']} — 合計 {p['cost']:,} 円  {tag_text}", expanded=p["is_recommended"]):
+                if p["is_recommended"]:
+                    st.success(p['recommend_reason'])
+
+                st.write(f"🗺️ **詳細ルート:** {p['display_route']}")
+                st.write(f"⏱ **片道所要時間:** 約 {p['time_min']} 分")
+                st.write(f"🏨 **宿泊条件:** {p['note']}")
+                st.write("**💰 費目別内訳:**")
+                for item, amt in p["breakdown"].items():
+                    st.write(f"　・ {item}: **{amt:,}** 円")
+
+                excel_bytes = create_excel_report(p, normalized_address, headcount, work_days)
+                st.download_button(
+                    label=f"📥 Excel見積書をダウンロード",
+                    data=excel_bytes,
+                    file_name=f"交通費見積書_{st_name}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key=f"dl_{st_name}_{p['type']}"
+                )
+        st.markdown("---")
 
 
