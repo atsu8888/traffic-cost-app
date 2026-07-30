@@ -23,6 +23,7 @@ import json
 import math
 import io
 import re
+import time
 import unicodedata
 import requests
 from datetime import datetime, timedelta
@@ -61,6 +62,11 @@ FLIGHT_MOVE_TYPES = {
 
 GEMINI_MODEL = "gemini-3.5-flash"
 
+# リトライ設定
+MAX_RETRIES = 3
+RETRY_WAIT_SECONDS = [5, 15, 30]  # 1回目5秒、2回目15秒、3回目30秒待機
+RETRYABLE_STATUS_CODES = {429, 503}
+
 
 # ============================================================
 # APIキー取得（st.secrets から安全に読み込み）
@@ -86,6 +92,61 @@ def get_api_keys() -> tuple[str, str]:
         )
         st.stop()
         return "", ""
+
+
+# ============================================================
+# Gemini API リトライラッパー
+# ============================================================
+
+def call_gemini_with_retry(client, model: str, contents: str, config, retry_status_placeholder=None) -> str:
+    """
+    Gemini API呼び出しをリトライ付きで実行する。
+    429 (RESOURCE_EXHAUSTED) や 503 (UNAVAILABLE) の場合に自動リトライ。
+
+    Returns:
+        レスポンスのテキスト。全リトライ失敗時は None を返す。
+    """
+    last_error = None
+
+    for attempt in range(MAX_RETRIES):
+        try:
+            response = client.models.generate_content(
+                model=model,
+                contents=contents,
+                config=config,
+            )
+            return response.text
+
+        except Exception as e:
+            last_error = e
+            error_str = str(e)
+
+            # リトライ対象のエラーか判定
+            is_retryable = any(str(code) in error_str for code in RETRYABLE_STATUS_CODES)
+
+            if not is_retryable:
+                # リトライ対象外のエラー（400, 404等）はすぐ失敗
+                raise e
+
+            # 最後の試行ならリトライしない
+            if attempt >= MAX_RETRIES - 1:
+                break
+
+            wait_sec = RETRY_WAIT_SECONDS[attempt]
+
+            # UIにリトライ状況を表示
+            if retry_status_placeholder:
+                retry_status_placeholder.warning(
+                    f"⏳ サーバー混雑中... {wait_sec}秒後にリトライします（{attempt + 1}/{MAX_RETRIES}回目）"
+                )
+
+            time.sleep(wait_sec)
+
+            if retry_status_placeholder:
+                retry_status_placeholder.empty()
+
+    # 全リトライ失敗
+    raise last_error
 
 
 # ============================================================
@@ -387,25 +448,33 @@ Google検索は不要です。あなたの知識のみで回答してくださ�
         "dest_lon": None,
     }
 
+    # リトライ状況表示用のプレースホルダー
+    retry_placeholder = st.empty()
+
     try:
-        # ★ Google Search なし — 軽量リクエスト（トークン消費少）
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                temperature=0.1,
-            )
+        config = types.GenerateContentConfig(
+            temperature=0.1,
         )
 
-        text = response.text
-        parsed_data = parse_json_from_text(text)
-        if parsed_data:
-            fallback_data.update(parsed_data)
+        text = call_gemini_with_retry(
+            client=client,
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=config,
+            retry_status_placeholder=retry_placeholder,
+        )
+
+        if text:
+            parsed_data = parse_json_from_text(text)
+            if parsed_data:
+                fallback_data.update(parsed_data)
 
     except Exception as e:
         st.warning(f"⚠️ Gemini API呼び出し失敗（フォールバック値を使用）: {e}")
+    finally:
+        retry_placeholder.empty()
 
-    # 座標のフォールバック（Geminiが座標を返せなかった場合）
+    # 座標のフォールバック
     if not fallback_data.get("dest_lat") or not fallback_data.get("dest_lon"):
         lat, lon = geocode_fallback(fallback_data["normalized_address"])
         fallback_data["dest_lat"] = lat
@@ -459,28 +528,35 @@ def search_flight_fare_with_gemini(raw_address: str, airport_name: str, gemini_k
         "flight_time_min": 180,
     }
 
+    retry_placeholder = st.empty()
+
     try:
-        # ★ 離島の運賃検索時のみ Google Search Grounding を使用
         google_search_tool = types.Tool(
             google_search=types.GoogleSearch()
         )
 
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                tools=[google_search_tool],
-                temperature=0.1,
-            )
+        config = types.GenerateContentConfig(
+            tools=[google_search_tool],
+            temperature=0.1,
         )
 
-        text = response.text
-        parsed_data = parse_json_from_text(text)
-        if parsed_data:
-            fallback_data.update(parsed_data)
+        text = call_gemini_with_retry(
+            client=client,
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=config,
+            retry_status_placeholder=retry_placeholder,
+        )
+
+        if text:
+            parsed_data = parse_json_from_text(text)
+            if parsed_data:
+                fallback_data.update(parsed_data)
 
     except Exception as e:
         st.warning(f"⚠️ 運賃検索失敗（フォールバック値を使用）: {e}")
+    finally:
+        retry_placeholder.empty()
 
     return fallback_data
 
