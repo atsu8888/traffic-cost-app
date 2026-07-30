@@ -53,7 +53,7 @@ FLIGHT_MOVE_TYPES = {
     "domestic_flight", "international_flight", "domestic_air"
 }
 
-GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_MODEL = "gemini-3.5-flash"
 
 
 # ============================================================
