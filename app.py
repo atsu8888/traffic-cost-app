@@ -64,8 +64,11 @@ GEMINI_MODEL = "gemini-3.5-flash"
 
 # リトライ設定
 MAX_RETRIES = 3
-RETRY_WAIT_SECONDS = [5, 15, 30]  # 1回目5秒、2回目15秒、3回目30秒待機
+RETRY_WAIT_SECONDS = [5, 15, 30]
 RETRYABLE_STATUS_CODES = {429, 503}
+
+# デバッグモード（Trueにするとレスポンス詳細を表示）
+DEBUG_MODE = True
 
 
 # ============================================================
@@ -73,9 +76,6 @@ RETRYABLE_STATUS_CODES = {429, 503}
 # ============================================================
 
 def get_api_keys() -> tuple[str, str]:
-    """
-    Streamlit Cloud の Secrets からAPIキーを取得する。
-    """
     try:
         gemini_key = st.secrets["api_keys"]["gemini"]
         navitime_key = st.secrets["api_keys"]["navitime"]
@@ -99,13 +99,6 @@ def get_api_keys() -> tuple[str, str]:
 # ============================================================
 
 def call_gemini_with_retry(client, model: str, contents: str, config, retry_status_placeholder=None) -> str:
-    """
-    Gemini API呼び出しをリトライ付きで実行する。
-    429 (RESOURCE_EXHAUSTED) や 503 (UNAVAILABLE) の場合に自動リトライ。
-
-    Returns:
-        レスポンスのテキスト。全リトライ失敗時は None を返す。
-    """
     last_error = None
 
     for attempt in range(MAX_RETRIES):
@@ -121,20 +114,16 @@ def call_gemini_with_retry(client, model: str, contents: str, config, retry_stat
             last_error = e
             error_str = str(e)
 
-            # リトライ対象のエラーか判定
             is_retryable = any(str(code) in error_str for code in RETRYABLE_STATUS_CODES)
 
             if not is_retryable:
-                # リトライ対象外のエラー（400, 404等）はすぐ失敗
                 raise e
 
-            # 最後の試行ならリトライしない
             if attempt >= MAX_RETRIES - 1:
                 break
 
             wait_sec = RETRY_WAIT_SECONDS[attempt]
 
-            # UIにリトライ状況を表示
             if retry_status_placeholder:
                 retry_status_placeholder.warning(
                     f"⏳ サーバー混雑中... {wait_sec}秒後にリトライします（{attempt + 1}/{MAX_RETRIES}回目）"
@@ -145,7 +134,6 @@ def call_gemini_with_retry(client, model: str, contents: str, config, retry_stat
             if retry_status_placeholder:
                 retry_status_placeholder.empty()
 
-    # 全リトライ失敗
     raise last_error
 
 
@@ -154,7 +142,6 @@ def call_gemini_with_retry(client, model: str, contents: str, config, retry_stat
 # ============================================================
 
 def round_up_1000(amount: float) -> int:
-    """1000円単位で切り上げ。"""
     if amount < 0:
         st.warning(f"⚠️ 負の金額が検出されました: {amount}")
         return 0
@@ -164,7 +151,6 @@ def round_up_1000(amount: float) -> int:
 
 
 def haversine_km(lat1, lon1, lat2, lon2):
-    """2点間の距離をkm単位で計算（ハーバーサイン公式）"""
     r = 6371.0
     dlat = math.radians(lat2 - lat1)
     dlon = math.radians(lon2 - lon1)
@@ -175,7 +161,6 @@ def haversine_km(lat1, lon1, lat2, lon2):
 
 
 def get_display_width(text: str) -> int:
-    """日本語文字を考慮した表示幅を計算する"""
     width = 0
     for char in str(text):
         if unicodedata.east_asian_width(char) in ('F', 'W', 'A'):
@@ -186,7 +171,6 @@ def get_display_width(text: str) -> int:
 
 
 def guess_airport_from_address(address: str) -> str:
-    """住所から離島の空港名を推測するバックアップ処理"""
     mapping = [
         (["沖永良部", "知名町", "和泊町"], "沖永良部空港"),
         (["奄美", "龍郷町"], "奄美空港"),
@@ -207,7 +191,6 @@ def guess_airport_from_address(address: str) -> str:
 
 
 def parse_json_from_text(text: str) -> dict:
-    """テキストからJSONオブジェクトを安全に抽出する。"""
     start_idx = text.find('{')
     if start_idx == -1:
         return {}
@@ -402,7 +385,6 @@ def create_excel_report(pattern_data: dict, address: str, headcount: int, work_d
 # ============================================================
 
 def geocode_fallback(address: str):
-    """国土地理院APIによるジオコーディング（フォールバック）"""
     try:
         res = requests.get(GSI_GEOCODE_URL, params={"q": address}, timeout=5)
         if res.status_code == 200 and res.json():
@@ -416,8 +398,6 @@ def geocode_fallback(address: str):
 def analyze_destination_with_gemini(raw_address: str, gemini_key: str, origin_name: str) -> dict:
     """
     STEP 1: Gemini AI（Google Search なし）で目的地の基本情報を分析。
-    住所の正規化、座標取得、離島判定のみを行う。
-    運賃検索は行わない（トークン節約・レート制限対策）。
     """
     client = genai.Client(api_key=gemini_key.strip())
 
@@ -448,7 +428,6 @@ Google検索は不要です。あなたの知識のみで回答してくださ�
         "dest_lon": None,
     }
 
-    # リトライ状況表示用のプレースホルダー
     retry_placeholder = st.empty()
 
     try:
@@ -500,7 +479,6 @@ def search_flight_fare_with_gemini(raw_address: str, airport_name: str, gemini_k
     """
     STEP 1.5: 離島の場合のみ呼ばれる。
     Gemini + Google Search Grounding でリアルタイムの運賃・所要時間を検索する。
-    NAVITIMEが対応していない離島路線の運賃を取得するために使用。
     """
     client = genai.Client(api_key=gemini_key.strip())
     origin_city = "大阪" if "淀屋橋" in origin_name else "東京"
@@ -562,13 +540,13 @@ def search_flight_fare_with_gemini(raw_address: str, airport_name: str, gemini_k
 
 
 # ============================================================
-# STEP 2: NAVITIME API (全国・全交通手段を検索)
+# STEP 2: NAVITIME API (全国・全交通手段を検索) + デバッグログ
 # ============================================================
 
 def get_navitime_fastest_route(start_lat, start_lon, goal_lat, goal_lon, navitime_key: str):
     """
     STEP 2: 本土の目的地に対してNAVITIME APIで最速ルートを検索。
-    離島の場合はこの関数は呼ばれない。
+    DEBUG_MODE=True の場合、レスポンスの詳細をexpanderで表示する。
     """
     clean_key = navitime_key.strip()
     headers = {"X-RapidAPI-Key": clean_key, "X-RapidAPI-Host": NAVITIME_HOST}
@@ -587,19 +565,39 @@ def get_navitime_fastest_route(start_lat, start_lon, goal_lat, goal_lon, navitim
         res = requests.get(NAVITIME_URL, headers=headers, params=params, timeout=15)
         if res.status_code != 200:
             st.warning(f"⚠️ NAVITIME API エラー: HTTP {res.status_code}")
+            if DEBUG_MODE:
+                st.code(res.text[:2000], language="json")
             return None
 
         data = res.json()
         items = data.get("items", [])
         if not items:
             st.warning("⚠️ NAVITIME: ルートが見つかりませんでした。")
+            if DEBUG_MODE:
+                with st.expander("🔍 [DEBUG] NAVITIMEレスポンス全体"):
+                    st.json(data)
             return None
 
         fastest_item = min(items, key=lambda x: x.get("summary", {}).get("move", {}).get("time", 99999))
         time_min = fastest_item.get("summary", {}).get("move", {}).get("time", 0)
 
         move_info = fastest_item.get("summary", {}).get("move", {})
-        total_fare = move_info.get("fare", {}).get("unit_0", 0) if isinstance(move_info.get("fare"), dict) else 0
+        
+        # ★ 運賃取得: unit_0 だけでなく全 unit を合算
+        fare_dict = move_info.get("fare", {})
+        if isinstance(fare_dict, dict):
+            total_fare = sum(
+                v for k, v in fare_dict.items()
+                if k.startswith("unit_") and isinstance(v, (int, float))
+            )
+            fare_unit_0 = fare_dict.get("unit_0", 0)
+            fare_unit_1 = fare_dict.get("unit_1", 0)
+            fare_unit_2 = fare_dict.get("unit_2", 0)
+        else:
+            total_fare = 0
+            fare_unit_0 = 0
+            fare_unit_1 = 0
+            fare_unit_2 = 0
 
         has_flight = False
         flight_fare = 0
@@ -613,9 +611,26 @@ def get_navitime_fastest_route(start_lat, start_lon, goal_lat, goal_lon, navitim
 
         sections = fastest_item.get("sections", [])
 
+        # ★ デバッグ: セクション詳細を収集
+        debug_sections = []
+
         for i, sec in enumerate(sections):
             m_type = sec.get("move", "")
             sec_type = sec.get("type", "")
+
+            # デバッグ情報収集
+            if DEBUG_MODE:
+                debug_sec = {
+                    "index": i,
+                    "type": sec_type,
+                    "move": m_type,
+                    "name": sec.get("name", ""),
+                    "time": sec.get("time", ""),
+                    "fare": sec.get("fare", {}),
+                    "line_name": sec.get("line_name", ""),
+                    "transport": sec.get("transport", ""),
+                }
+                debug_sections.append(debug_sec)
 
             if sec_type == "point":
                 if not start_station_name:
@@ -631,7 +646,11 @@ def get_navitime_fastest_route(start_lat, start_lon, goal_lat, goal_lon, navitim
             if sec_type == "move" and m_type.lower() in FLIGHT_MOVE_TYPES:
                 has_flight = True
                 if "fare" in sec and isinstance(sec["fare"], dict):
-                    flight_fare += sec["fare"].get("unit_0", 0)
+                    # 飛行機セクションも全unit合算
+                    flight_fare += sum(
+                        v for k, v in sec["fare"].items()
+                        if k.startswith("unit_") and isinstance(v, (int, float))
+                    )
 
                 if not flight_start_name:
                     for j in range(i - 1, -1, -1):
@@ -654,7 +673,7 @@ def get_navitime_fastest_route(start_lat, start_lon, goal_lat, goal_lon, navitim
         else:
             access_train_fare = 0
 
-        return {
+        result = {
             "has_flight": has_flight,
             "time_min": time_min,
             "total_fare": int(total_fare),
@@ -668,6 +687,52 @@ def get_navitime_fastest_route(start_lat, start_lon, goal_lat, goal_lon, navitim
             "flight_start": flight_start_name,
             "flight_end": flight_end_name
         }
+
+        # ★ デバッグ表示
+        if DEBUG_MODE:
+            with st.expander("🔍 [DEBUG] NAVITIMEレスポンス詳細", expanded=False):
+                st.markdown("**📡 リクエストパラメータ:**")
+                st.json(params)
+
+                st.markdown("**📊 Summary (move):**")
+                st.json(move_info)
+
+                st.markdown(f"**💰 運賃内訳 (fare):**")
+                st.markdown(f"- `unit_0` (乗車券?): **{fare_unit_0:,}** 円")
+                st.markdown(f"- `unit_1` (特急券?): **{fare_unit_1:,}** 円")
+                st.markdown(f"- `unit_2` (その他?): **{fare_unit_2:,}** 円")
+                st.markdown(f"- **合算 total_fare: {total_fare:,} 円**")
+
+                st.markdown(f"**✈️ 飛行機判定:** `has_flight = {has_flight}`")
+                if has_flight:
+                    st.markdown(f"- flight_fare: **{flight_fare:,}** 円")
+                    st.markdown(f"- access_train_fare: **{access_train_fare:,}** 円")
+                    st.markdown(f"- flight_start: {flight_start_name}")
+                    st.markdown(f"- flight_end: {flight_end_name}")
+
+                st.markdown("**🚏 セクション詳細:**")
+                for ds in debug_sections:
+                    sec_label = f"[{ds['index']}] type={ds['type']}, move={ds['move']}"
+                    if ds['name']:
+                        sec_label += f", name={ds['name']}"
+                    if ds['line_name']:
+                        sec_label += f", line={ds['line_name']}"
+                    if ds['transport']:
+                        sec_label += f", transport={ds['transport']}"
+                    if ds['time']:
+                        sec_label += f", time={ds['time']}min"
+                    if ds['fare']:
+                        sec_label += f", fare={ds['fare']}"
+                    st.text(sec_label)
+
+                st.markdown("**📋 最終計算結果:**")
+                st.json(result)
+
+                st.markdown("**📦 生レスポンス (fastest_item):**")
+                st.json(fastest_item)
+
+        return result
+
     except requests.exceptions.Timeout:
         st.warning("⚠️ NAVITIME API: タイムアウトしました。")
         return None
@@ -798,7 +863,7 @@ def build_best_route_patterns(current_st_name: str, ai_info: dict, navitime_rout
     rental_days = work_days + (1 if "前泊" in stay_note else 0)
     rental_car_total = round_up_1000(RENTAL_CAR_COST_PER_DAY * rental_days)
 
-    # タクシー計算: taxi_trips = 宿泊数+1 = 現地滞在日数分の往復回数
+    # タクシー計算
     taxi_one_way = base_taxi_km * TAXI_FARE_PER_KM
     taxi_trips = nights + 1
     taxi_total = round_up_1000(taxi_one_way * 2 * taxi_trips)
@@ -845,6 +910,33 @@ def build_best_route_patterns(current_st_name: str, ai_info: dict, navitime_rout
     if is_ai_fare:
         recommend_msg += " / ⚠️ AI相場検索(運賃1.3倍マージン)"
 
+    # ★ デバッグ: 費用計算の内訳を表示
+    if DEBUG_MODE:
+        with st.expander("🔍 [DEBUG] 費用計算の内訳", expanded=False):
+            st.markdown(f"**selected_mode:** `{selected_mode}`")
+            st.markdown(f"**time_min:** {time_min} 分 ({travel_hours:.1f} 時間)")
+            st.markdown(f"**nights:** {nights} 泊")
+            st.markdown(f"**base_taxi_km:** {base_taxi_km:.1f} km")
+            st.markdown(f"**taxi_trips:** {taxi_trips} 回")
+            st.markdown("---")
+            if selected_mode == "flight":
+                st.markdown(f"**flight_fare (片道):** {flight_fare:,} 円")
+                st.markdown(f"**access_train_fare (片道):** {access_train_fare:,} 円")
+            else:
+                st.markdown(f"**total_fare (片道):** {navitime_route['total_fare']:,} 円")
+            st.markdown("---")
+            st.markdown("**タクシーパターン:**")
+            for k, v in b_taxi.items():
+                st.markdown(f"- {k}: **{v:,}** 円")
+            st.markdown(f"- **合計: {taxi_sum:,} 円**")
+            st.markdown("---")
+            st.markdown("**レンタカーパターン:**")
+            for k, v in b_rental.items():
+                st.markdown(f"- {k}: **{v:,}** 円")
+            st.markdown(f"- **合計: {rental_sum:,} 円**")
+            st.markdown("---")
+            st.markdown(f"**採用:** {'レンタカー' if rental_sum < taxi_sum else 'タクシー'}")
+
     patterns.append({
         "type": final_type,
         "name": final_name,
@@ -868,7 +960,11 @@ def build_best_route_patterns(current_st_name: str, ai_info: dict, navitime_rout
 st.set_page_config(page_title="交通費・出張見積もりアプリ", page_icon="🚗", layout="wide")
 st.title("🚗 交通費・出張見積もりアプリ")
 
-# サーバー側でAPIキーを取得（ユーザーには見えない）
+# デバッグモード表示
+if DEBUG_MODE:
+    st.caption("🐛 デバッグモード ON — NAVITIMEレスポンスと計算内訳が表示されます")
+
+# サーバー側でAPIキーを取得
 gemini_api_key, navitime_api_key = get_api_keys()
 
 col1, col2 = st.columns([2, 1])
@@ -903,6 +999,11 @@ if st.button("🚀 最速出張見積もりを計算する", type="primary"):
 
         st.success(f"**📍 検索地点:** {ai_info.get('normalized_address', address_input)}")
 
+        # デバッグ: Gemini分析結果
+        if DEBUG_MODE:
+            with st.expander("🔍 [DEBUG] Gemini分析結果 (STEP 1)", expanded=False):
+                st.json(ai_info)
+
         train_route = None
         if ai_info.get("is_island_or_remote", False):
             st.info("💡 **海を渡る離島・遠隔地と判定されました。NAVITIME検索をスキップし、飛行機ルートを適用します。**")
@@ -913,10 +1014,13 @@ if st.button("🚀 最速出張見積もりを計算する", type="primary"):
                 fare_info = search_flight_fare_with_gemini(
                     address_input, airport_name, gemini_api_key, current_st_name
                 )
-            # 運賃情報をai_infoにマージ
             ai_info.update(fare_info)
 
-            # 空港座標のフォールバック
+            # デバッグ: 運賃検索結果
+            if DEBUG_MODE:
+                with st.expander("🔍 [DEBUG] 運賃検索結果 (STEP 1.5)", expanded=False):
+                    st.json(fare_info)
+
             if not ai_info.get("airport_lat"):
                 ai_info["airport_lat"] = ai_info["dest_lat"] if ai_info["dest_lat"] else 24.3964
                 ai_info["airport_lon"] = ai_info["dest_lon"] if ai_info["dest_lon"] else 124.2450
