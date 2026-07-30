@@ -753,7 +753,7 @@ gemini_api_key, navitime_api_key = get_api_keys()
 
 col1, col2 = st.columns([2, 1])
 with col1:
-    address_input = st.text_input("目的地（住所や施設名）"
+   address_input = st.text_input("目的地（住所や施設名）", "")
 with col2:
     station_choice = st.selectbox("出発拠点", ["淀屋橋駅", "大宮駅", "両方比較"], index=0)
 
