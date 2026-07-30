@@ -1,12 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-交通費・出張見積もりアプリ（Excelフォーマット復元・経路1行表示版）
+交通費・出張見積もりアプリ（指定Excelフォーマット完全準拠版）
 
 機能:
   - 離島/遠方はAIで判定し、NAVITIMEをスキップしてGoogle検索の運賃(1.3倍)を採用
   - NAVITIMEの「goal」表記を確実に除外し、最終駅(例: 南新庄駅)を抽出
-  - Excelのフォーマット崩れを修正し、元のきれいな自動幅調整レイアウトに復元
-  - 乗り継ぎのアクセス電車ルートを改行せず「淀屋橋 ➔ 伊丹 / 庄内 ➔ 南新庄」と1行で表示
+  - ユーザー指定のExcelフォーマット（A1〜H14等の固定レイアウト）に完全に準拠
   - 現地移動（タクシー vs レンタカー）を内部で比較し、安い方「だけ」を1つ出力
   - 試算結果を社内フォーマットのExcelファイル(.xlsx)として自動出力
 """
@@ -21,8 +20,7 @@ from datetime import datetime, timedelta
 import streamlit as st
 import google.generativeai as genai
 import openpyxl
-from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
-from openpyxl.utils import get_column_letter
+from openpyxl.styles import Font, Alignment, Border, Side
 
 # ============================================================
 # 定数・固定値
@@ -70,7 +68,6 @@ def get_active_gemini_model_name():
     return "models/gemini-2.5-flash"
 
 def guess_airport_from_address(address: str) -> str:
-    """住所から離島の空港名を推測するバックアップ処理"""
     if "沖永良部" in address or "知名町" in address or "和泊町" in address: return "沖永良部空港"
     if "奄美" in address or "龍郷町" in address: return "奄美空港"
     if "徳之島" in address or "伊仙町" in address or "天城町" in address: return "徳之島空港"
@@ -86,144 +83,187 @@ def guess_airport_from_address(address: str) -> str:
 
 
 # ============================================================
-# Excelファイル出力関数
+# Excelファイル出力関数（指定フォーマット完全準拠）
 # ============================================================
 
 def create_excel_report(pattern_data: dict, address: str, headcount: int, work_days: int) -> bytes:
     wb = openpyxl.Workbook()
     ws = wb.active
-    ws.title = "交通費見積"
-    ws.views.sheetView[0].showGridLines = True
-
-    table_hdr_fill = PatternFill(start_color="D9531E", end_color="D9531E", fill_type="solid")
-    dark_gray_fill = PatternFill(start_color="7F7F7F", end_color="7F7F7F", fill_type="solid")
-    light_yellow_fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
-
-    font_title = Font(name="游ゴシック", size=11, bold=True)
-    font_bold = Font(name="游ゴシック", size=9, bold=True)
-    font_normal = Font(name="游ゴシック", size=9)
-    font_hdr_white = Font(name="游ゴシック", size=9, bold=True, color="FFFFFF")
-    thin_border = Border(left=Side(style='thin', color='A6A6A6'), right=Side(style='thin', color='A6A6A6'), top=Side(style='thin', color='A6A6A6'), bottom=Side(style='thin', color='A6A6A6'))
+    ws.title = "交通費"
+    
+    font_normal = Font(name="ＭＳ Ｐゴシック", size=11)
     align_center = Alignment(horizontal='center', vertical='center')
     align_left = Alignment(horizontal='left', vertical='center')
 
-    ws["A1"] = "設置設定作業"
-    ws["A1"].font = font_title
+    # 基本情報の書き込み
+    ws["B2"] = "設置設定作業"
+    ws["H2"] = "基本大阪と埼玉のどちらか近い方から算出するが、TIS、CSI案件のみ全て大阪から算出する。"
+    ws["S2"] = "作業日数"
+    ws["T2"] = "サーバ台数"
+    
+    ws["H3"] = "大阪：淀屋橋駅、埼玉：大宮駅"
+    ws["S3"] = "2日（作業日1日、予備日：1日）"
+    ws["T3"] = "1台"
+    
     ws["B4"] = "住所"
-    ws["B4"].font = font_title
-    ws["B4"].fill = light_yellow_fill
-    ws["B4"].alignment = align_center
-    ws["C4"] = f"〒{address}"
-    ws["C4"].font = font_title
-    ws["C4"].fill = light_yellow_fill
+    ws["C4"] = address  # 住所はフォーマットだと特に指定行がないためB4の横に配置と仮定
+    ws["S4"] = "4日（作業日3日、予備日：1日）"
+    ws["T4"] = "2～5台まで"
+    
     ws["B5"] = "人数"
-    ws["B5"].font = font_bold
-    ws["B5"].alignment = align_center
-    ws["C5"] = f"{headcount} 人"
-    ws["C5"].font = font_normal
-    ws["C5"].alignment = align_center
+    ws["C5"] = headcount
+    ws["D5"] = "人"
+    ws["S5"] = "5日（作業日4日、予備日：1日）"
+    ws["T5"] = "6台以上"
+    
     ws["B6"] = "作業"
-    ws["B6"].font = font_bold
-    ws["B6"].alignment = align_center
-    ws["C6"] = f"{work_days} 日"
-    ws["C6"].font = font_normal
-    ws["C6"].alignment = align_center
-
+    ws["C6"] = work_days
+    ws["D6"] = "日"
+    
     travel_days = 2 if "前泊" in pattern_data.get("note", "") else 1
     ws["B7"] = "移動"
-    ws["B7"].font = font_bold
-    ws["B7"].alignment = align_center
-    ws["C7"] = f"{travel_days} 日"
-    ws["C7"].font = font_normal
-    ws["C7"].alignment = align_center
+    ws["C7"] = travel_days
+    ws["D7"] = "日"
+    ws["E7"] = "※移動に2.5h以上かかる場合は宿泊想定／移動に4h以上かかる場合又は飛行機を利用の場合はさらに前泊か後泊想定"
 
-    headers = ["チェック", "項目", "経路", "調整費用", "実費用", "日数・泊数", "人数", "合計", "片道移動時間 (h)"]
-    for col_num, hdr in enumerate(headers, 1):
-        cell = ws.cell(row=10, column=col_num)
-        cell.value = hdr
-        cell.font = font_hdr_white
-        cell.fill = table_hdr_fill
-        cell.alignment = align_center
-        cell.border = thin_border
+    ws["M8"] = "※最大費用の経路を想定"
 
-    row_idx = 11
-    total_sum = 0
+    # ヘッダー行
+    headers = {
+        "B9": "チェック", "C9": "項目", "H9": "経路", "M9": "調整費用", 
+        "N9": "実費用", "O9": "日数・泊数", "P9": "人数", "Q9": "合計", "R9": "片路移動時間（h）"
+    }
+    for cell_pos, val in headers.items():
+        ws[cell_pos] = val
+
     breakdown = pattern_data.get("breakdown", {})
     routes = pattern_data.get("routes", {})
+    route_details = pattern_data.get("route_details", {}) # {start: 'xx', flight_start: 'xx', flight_end: 'xx', end: 'xx'}
+    
+    is_flight = "flight_start" in route_details and route_details["flight_start"]
+    start_st = route_details.get("start", "出発駅")
+    end_st = route_details.get("end", "到着駅")
+    f_start = route_details.get("flight_start", "")
+    f_end = route_details.get("flight_end", "")
 
-    items_def = [
-        {"name": "電車・新幹線（往復）", "key": "電車・新幹線運賃", "route": routes.get("train", "-")},
-        {"name": "飛行機（往復）", "key": "航空券費用", "route": routes.get("flight", "-")},
-        {"name": "電車・新幹線（往復）", "key": "アクセス電車運賃", "route": routes.get("access", "-")},
-        {"name": "レンタカー", "key": "レンタカー費用", "route": routes.get("rental", "-")},
-        {"name": "タクシー（往復）", "key": "タクシー運賃", "route": routes.get("taxi", "-")},
-        {"name": "宿泊", "key": "宿泊費", "route": "-"},
-    ]
+    # 各行のデータ構築 (フォーマットに合わせたセル分割)
+    # 電車・新幹線（アクセス/純粋）
+    has_train = "電車・新幹線運賃" in list(breakdown.keys())[0] if breakdown else False
+    if is_flight:
+        train_val = breakdown.get("最寄り空港アクセス電車運賃(往復・人数分)", 0)
+        train_chk = "✓" if train_val > 0 else "-"
+        train_route_1 = start_st
+        train_route_2 = f_start
+    else:
+        train_val = list(breakdown.values())[0] if breakdown else 0
+        train_chk = "✓" if train_val > 0 else "-"
+        train_route_1 = start_st
+        train_route_2 = end_st
 
-    time_hours = round(pattern_data.get("time_min", 0) / 60.0, 1)
+    # 飛行機
+    flight_val = breakdown.get("航空券費用(往復・人数分)", 0) if is_flight else 0
+    flight_chk = "-" if not is_flight else "✓"
+    flight_route_1 = f_start if is_flight else ""
+    flight_route_2 = f_end if is_flight else ""
 
-    for item in items_def:
-        amount = 0
-        for k, v in breakdown.items():
-            if item["key"] in k:
-                amount = v
-                break
+    # レンタカー
+    rental_key = next((k for k in breakdown if "レンタカー" in k), None)
+    rental_val = breakdown[rental_key] if rental_key else 0
+    rental_chk = "✓" if rental_val > 0 else "-"
+    
+    # タクシー
+    taxi_key = next((k for k in breakdown if "タクシー" in k), None)
+    taxi_val = breakdown[taxi_key] if taxi_key else 0
+    taxi_chk = "✓" if taxi_val > 0 else "-"
 
-        is_checked = amount > 0
-        chk_mark = "✓" if is_checked else "-"
+    # 宿泊
+    hotel_val = breakdown.get("宿泊費", 0)
+    hotel_chk = "✓" if hotel_val > 0 else "-"
 
-        ws.cell(row=row_idx, column=1, value=chk_mark).alignment = align_center
-        ws.cell(row=row_idx, column=2, value=item["name"]).alignment = align_left
-        
-        # 経路セルの設定（元のフォーマット通り1行で表示）
-        route_val = item["route"] if is_checked else "-"
-        ws.cell(row=row_idx, column=3, value=route_val).alignment = align_left
-        
-        ws.cell(row=row_idx, column=4, value=amount).number_format = '#,##0'
-        ws.cell(row=row_idx, column=5, value=amount).number_format = '#,##0'
-        
-        days_val = 1
-        if "宿泊" in item["name"]:
-            days_val = max(work_days, 1) + (1 if "前泊" in pattern_data.get("note", "") else 0)
-        elif "レンタカー" in item["name"]:
-            days_val = work_days + (1 if "前泊" in pattern_data.get("note", "") else 0)
-        elif "タクシー" in item["name"]:
-            days_val = work_days + 1
+    # --- 行ごとの書き込み ---
+    
+    # Row 10: 電車・新幹線（往復） 又は アクセス電車（往復）出発側
+    ws["B10"] = train_chk
+    ws["C10"] = "電車・新幹線（往復）　"
+    ws["H10"] = train_route_1
+    ws["I10"] = "駅->"
+    ws["J10"] = train_route_2
+    ws["K10"] = "駅"
+    ws["M10"] = train_val
+    ws["N10"] = train_val
+    ws["O10"] = 1
+    ws["P10"] = headcount
+    ws["Q10"] = train_val
+    ws["R10"] = round(pattern_data.get("time_min", 0) / 60.0, 1)
 
-        ws.cell(row=row_idx, column=6, value=days_val if is_checked else 1).alignment = align_center
-        ws.cell(row=row_idx, column=7, value=headcount).alignment = align_center
-        
-        row_total = amount
-        ws.cell(row=row_idx, column=8, value=row_total).number_format = '#,##0'
-        
-        if row_idx == 11 or (row_idx == 12 and is_checked):
-            ws.cell(row=row_idx, column=9, value=time_hours).alignment = align_center
+    # Row 11: 飛行機（往復）
+    ws["B11"] = flight_chk
+    ws["C11"] = "飛行機（往復）　"
+    ws["H11"] = flight_route_1
+    ws["I11"] = "空港->" if is_flight else ""
+    ws["J11"] = flight_route_2
+    ws["K11"] = "空港" if is_flight else ""
+    ws["M11"] = flight_val
+    ws["N11"] = flight_val
+    ws["O11"] = 1
+    ws["P11"] = headcount
+    ws["Q11"] = flight_val
+    if is_flight and pattern_data.get("is_ai_fare"):
+        ws["S11"] = "ANA/フレックスで試算(AI概算1.3倍)"
 
-        for c in range(1, 10):
-            cell = ws.cell(row=row_idx, column=c)
-            cell.font = font_normal
-            cell.border = thin_border
-            if not is_checked and c != 1:
-                cell.fill = dark_gray_fill
+    # Row 12: 到着側のアクセス電車（必要な場合のみ）
+    if is_flight and f_end != end_st:
+        ws["B12"] = "✓"
+        ws["C12"] = "電車・新幹線（往復）　"
+        ws["H12"] = f_end
+        ws["I12"] = "駅->"
+        ws["J12"] = end_st
+        ws["K12"] = "駅"
+        # 料金はアクセス電車代（10行目）に合算されている想定とする
+        ws["M12"] = 0
+        ws["N12"] = 0
+        ws["O12"] = 1
+        ws["P12"] = headcount
+        ws["Q12"] = 0
+    else:
+        ws["B12"] = "-"
+        ws["C12"] = "電車・新幹線（往復）　"
+        ws["I12"] = "駅->"
+        ws["K12"] = "駅"
 
-        total_sum += row_total
-        row_idx += 1
+    # Row 13: レンタカー
+    ws["B13"] = rental_chk
+    ws["C13"] = "レンタカー"
+    ws["M13"] = rental_val
+    ws["O13"] = work_days + (1 if travel_days > 1 else 0)
+    ws["P13"] = 1 # レンタカーは1台換算
+    ws["Q13"] = rental_val
 
-    ws.cell(row=row_idx, column=7, value="合計").alignment = align_center
-    ws.cell(row=row_idx, column=7).font = font_bold
-    total_cell = ws.cell(row=row_idx, column=8, value=pattern_data.get("cost", total_sum))
-    total_cell.number_format = '#,##0'
-    total_cell.font = font_bold
-    total_cell.border = thin_border
-    ws.cell(row=row_idx, column=9, value=time_hours).alignment = align_center
-    ws.cell(row=row_idx, column=9).font = font_bold
-    ws.cell(row=row_idx, column=9).border = thin_border
+    # Row 14: タクシー
+    ws["B14"] = taxi_chk
+    ws["C14"] = "タクシー（往復）"
+    ws["M14"] = taxi_val
+    ws["O14"] = travel_days + work_days
+    ws["P14"] = 1
+    ws["Q14"] = taxi_val
 
-    # C列（経路）を含め、元のフォーマット通りに文字数に合わせて自動で幅を調整する
-    for col in ws.columns:
-        max_len = max(len(str(cell.value or '')) for cell in col)
-        col_letter = get_column_letter(col[0].column)
-        ws.column_dimensions[col_letter].width = max(max_len + 3, 15)
+    # Row 15: 宿泊
+    ws["B15"] = hotel_chk
+    ws["C15"] = "宿泊"
+    ws["M15"] = HOTEL_COST_PER_NIGHT_PER_PERSON
+    ws["O15"] = travel_days - 1 + work_days
+    ws["P15"] = headcount
+    ws["Q15"] = hotel_val
+
+    # 合計行
+    ws["Q16"] = pattern_data.get("cost", 0)
+    ws["R16"] = round(pattern_data.get("time_min", 0) / 60.0, 1)
+
+    # 全体フォント適用
+    for row in ws.iter_rows():
+        for cell in row:
+            if cell.value is not None:
+                cell.font = font_normal
 
     output = io.BytesIO()
     wb.save(output)
@@ -360,11 +400,11 @@ def get_navitime_fastest_route(start_lat, start_lon, goal_lat, goal_lon, api_key
             sec_type = sec.get("type", "")
 
             if sec_type == "point":
-                if not start_station_name:
+                p_name = sec.get("name", "").lower()
+                if not start_station_name and "goal" not in p_name and "目的地" not in p_name:
                     start_station_name = sec.get("name")
                 
-                # 🌟 【修正】「goal」や「目的地周辺」などの曖昧な名前は無視し、駅や空港名だけを記録
-                p_name = sec.get("name", "").lower()
+                # goalを無視して駅名のみを記録
                 if "goal" not in p_name and "目的地" not in p_name:
                     end_station_name = sec.get("name")
                     if "coord" in sec:
@@ -453,7 +493,6 @@ def build_best_route_patterns(st_name: str, ai_info: dict, navitime_route: dict,
             airport_name = navitime_route["flight_end"] or "到着空港"
             end_st = navitime_route["end_station"]
             
-            # 🌟 【修正】乗り継ぎがある場合は改行せずスラッシュ区切りで1行にまとめる
             if airport_name == end_st:
                 access_str = f"{st_name} ➔ {origin_airport}"
             else:
@@ -468,6 +507,12 @@ def build_best_route_patterns(st_name: str, ai_info: dict, navitime_route: dict,
                 "taxi": f"{end_st} ↔ 目的地" if base_taxi_km > 0 else "現地徒歩",
                 "rental": f"{end_st} ➔ 目的地周辺"
             }
+            route_details = {
+                "start": st_name,
+                "flight_start": origin_airport,
+                "flight_end": airport_name,
+                "end": end_st
+            }
             route_title_prefix = f"✈️ 飛行機ルート ({airport_name}経由 {end_st}着)"
             is_ai_fare = False
             
@@ -480,6 +525,12 @@ def build_best_route_patterns(st_name: str, ai_info: dict, navitime_route: dict,
                 "access": "-",
                 "taxi": f"{end_st} ↔ 目的地" if base_taxi_km > 0 else "現地徒歩",
                 "rental": f"{end_st} ➔ 目的地周辺"
+            }
+            route_details = {
+                "start": st_name,
+                "flight_start": "",
+                "flight_end": "",
+                "end": end_st
             }
             route_title_prefix = f"🚄 新幹線/電車ルート ({end_st}着)"
             display_route_str = f"{st_name} ➔ {end_st} ➔ 目的地"
@@ -509,6 +560,12 @@ def build_best_route_patterns(st_name: str, ai_info: dict, navitime_route: dict,
             "access": f"{st_name} ➔ {origin_airport}",
             "taxi": f"{airport_name} ↔ 目的地",
             "rental": f"{airport_name} ➔ 目的地周辺"
+        }
+        route_details = {
+            "start": st_name,
+            "flight_start": origin_airport,
+            "flight_end": airport_name,
+            "end": airport_name
         }
         base_taxi_km = airport_to_dest_km
         route_title_prefix = f"✈️ 飛行機ルート ({airport_name}利用)"
@@ -541,9 +598,9 @@ def build_best_route_patterns(st_name: str, ai_info: dict, navitime_route: dict,
     
     if selected_mode == "flight":
         b_taxi["航空券費用(往復・人数分)"] = round_up_1000(flight_fare * 2 * headcount)
-        b_taxi["アクセス電車運賃(往復・人数分)"] = round_up_1000(access_train_fare * 2 * headcount)
+        b_taxi["最寄り空港アクセス電車運賃(往復・人数分)"] = round_up_1000(access_train_fare * 2 * headcount)
         b_rental["航空券費用(往復・人数分)"] = round_up_1000(flight_fare * 2 * headcount)
-        b_rental["アクセス電車運賃(往復・人数分)"] = round_up_1000(access_train_fare * 2 * headcount)
+        b_rental["最寄り空港アクセス電車運賃(往復・人数分)"] = round_up_1000(access_train_fare * 2 * headcount)
     else:
         b_taxi["電車・新幹線運賃(往復・人数分)"] = round_up_1000(navitime_route["total_fare"] * 2 * headcount)
         b_rental["電車・新幹線運賃(往復・人数分)"] = round_up_1000(navitime_route["total_fare"] * 2 * headcount)
@@ -586,9 +643,11 @@ def build_best_route_patterns(st_name: str, ai_info: dict, navitime_route: dict,
         "cost": final_cost,
         "breakdown": final_breakdown, 
         "note": stay_note,
-        "routes": route_dict, 
+        "routes": route_dict,
+        "route_details": route_details,
         "display_route": display_route_str,
         "recommend_reason": recommend_msg,
+        "is_ai_fare": is_ai_fare,
         "is_recommended": True
     })
 
