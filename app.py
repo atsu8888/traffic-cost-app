@@ -20,15 +20,10 @@
   STEP 3: パターン生成・比較 → 最安ルート表示
 
 運賃計算ルール:
-  - NAVITIME summary.fare の unit_0（乗車券+航空券）+ unit_3（指定席特急券）を使用
-  - unit_2（自由席）、unit_128〜141（定期券等）は無視
-  - 飛行機セクションの unit_0 を航空券費用として分離
-
-交通手段除外オプション:
-  - 飛行機を使用しない → NAVITIME APIに unuse=domestic_flight を指定
-  - 新幹線を使用しない → NAVITIME APIに unuse=superexpress_train を指定
-  - レンタカーを使用しない → STEP 3でレンタカーパターンを除外
-  - タクシーを使用しない → STEP 3でタクシーパターンを除外
+  - 在来線のみ → unit_0（乗車券）のみ
+  - 新幹線あり → unit_0（乗車券）+ unit_3（指定席特急券）
+  - 飛行機 → セクションの unit_0（flex/普通運賃）
+  - グリーン車料金は常に除外
 """
 
 import json
@@ -565,10 +560,10 @@ def get_navitime_fastest_route(start_lat, start_lon, goal_lat, goal_lon, navitim
         no_shinkansen: Trueの場合、新幹線を除外して検索
 
     運賃計算ルール:
-      - summary.fare の unit_0（乗車券+航空券）+ unit_3（指定席特急券）を合算
-      - unit_2（自由席）は使わない
-      - unit_128〜141（定期券等）は使わない
-      - 飛行機セクションの unit_0 を航空券として分離
+      - move_type に superexpress_train が含まれる → unit_0 + unit_3（乗車券+指定席特急券）
+      - move_type に superexpress_train が含まれない → unit_0 のみ（乗車券のみ）
+      - グリーン車料金は常に除外
+      - 飛行機セクションの unit_0 = flex（普通運賃）として使用
     """
     clean_key = navitime_key.strip()
     headers = {"X-RapidAPI-Key": clean_key, "X-RapidAPI-Host": NAVITIME_HOST}
@@ -615,19 +610,29 @@ def get_navitime_fastest_route(start_lat, start_lon, goal_lat, goal_lon, navitim
 
         move_info = fastest_item.get("summary", {}).get("move", {})
 
-        # ★ 運賃取得: unit_0（乗車券+航空券）+ unit_3（指定席特急券）のみ
+        # ★ move_type を取得して新幹線の有無を判定
+        move_types = move_info.get("move_type", [])
+        has_superexpress = "superexpress_train" in move_types
+
+        # ★ 運賃取得
         fare_dict = move_info.get("fare", {})
         if isinstance(fare_dict, dict):
             fare_unit_0 = fare_dict.get("unit_0", 0)  # 乗車券 + 航空券
-            fare_unit_2 = fare_dict.get("unit_2", 0)  # 自由席特急券（参考用・使わない）
-            fare_unit_3 = fare_dict.get("unit_3", 0)  # 指定席特急券
-            # ★ 指定席料金で計算: unit_0 + unit_3
-            total_fare = int(fare_unit_0 + fare_unit_3)
+            fare_unit_2 = fare_dict.get("unit_2", 0)  # 自由席特急券（参考表示のみ）
+            fare_unit_3 = fare_dict.get("unit_3", 0)  # 指定席特急券 or グリーン車
         else:
             fare_unit_0 = 0
             fare_unit_2 = 0
             fare_unit_3 = 0
-            total_fare = 0
+
+        # ★ 新幹線がある場合のみ unit_3（指定席特急券）を加算
+        #    在来線のみの場合、unit_3 はグリーン車料金なので除外
+        if has_superexpress:
+            total_fare = int(fare_unit_0 + fare_unit_3)
+            fare_note = "unit_0 + unit_3（乗車券+指定席特急券）"
+        else:
+            total_fare = int(fare_unit_0)
+            fare_note = "unit_0のみ（乗車券）※グリーン車除外"
 
         has_flight = False
         flight_fare = 0
@@ -675,7 +680,7 @@ def get_navitime_fastest_route(start_lat, start_lon, goal_lat, goal_lon, navitim
 
             if sec_type == "move" and m_type.lower() in FLIGHT_MOVE_TYPES:
                 has_flight = True
-                # ★ 飛行機セクションの unit_0 のみを航空券費用とする
+                # ★ 飛行機セクションの unit_0 = flex（普通運賃）
                 transport = sec.get("transport", {})
                 if transport and "fare" in transport and isinstance(transport["fare"], dict):
                     flight_fare += int(transport["fare"].get("unit_0", 0))
@@ -697,7 +702,7 @@ def get_navitime_fastest_route(start_lat, start_lon, goal_lat, goal_lon, navitim
         if has_flight:
             if flight_fare == 0:
                 flight_fare = int(total_fare * 0.8)
-            # ★ アクセス電車 = 全体(unit_0+unit_3) - 航空券(飛行機のunit_0)
+            # アクセス電車 = 全体 - 航空券
             access_train_fare = int(total_fare - flight_fare)
         else:
             access_train_fare = 0
@@ -727,15 +732,22 @@ def get_navitime_fastest_route(start_lat, start_lon, goal_lat, goal_lon, navitim
                 st.markdown("**📊 Summary (move):**")
                 st.json(move_info)
 
+                st.markdown(f"**🚄 move_type:** `{move_types}`")
+                st.markdown(f"**新幹線判定:** `has_superexpress = {has_superexpress}`")
+
                 st.markdown(f"**💰 運賃内訳 (fare):**")
                 st.markdown(f"- `unit_0` (乗車券+航空券): **{fare_unit_0:,.0f}** 円")
-                st.markdown(f"- `unit_2` (自由席特急券): ~~{fare_unit_2:,.0f}~~ 円 ← 不使用")
-                st.markdown(f"- `unit_3` (指定席特急券): **{fare_unit_3:,.0f}** 円")
-                st.markdown(f"- **採用合計 (unit_0 + unit_3): {total_fare:,} 円**")
+                if has_superexpress:
+                    st.markdown(f"- `unit_3` (指定席特急券): **{fare_unit_3:,.0f}** 円 ← 加算")
+                else:
+                    st.markdown(f"- `unit_3` (グリーン車?): ~~{fare_unit_3:,.0f}~~ 円 ← 除外（新幹線なし）")
+                st.markdown(f"- `unit_2` (自由席): ~~{fare_unit_2:,.0f}~~ 円 ← 不使用")
+                st.markdown(f"- **採用方式:** {fare_note}")
+                st.markdown(f"- **採用合計: {total_fare:,} 円**")
 
                 st.markdown(f"**✈️ 飛行機判定:** `has_flight = {has_flight}`")
                 if has_flight:
-                    st.markdown(f"- 航空券 (飛行機セクション unit_0): **{flight_fare:,}** 円")
+                    st.markdown(f"- 航空券 flex (飛行機セクション unit_0): **{flight_fare:,}** 円")
                     st.markdown(f"- 電車代 (全体 - 航空券): **{access_train_fare:,}** 円")
                     st.markdown(f"- flight_start: {flight_start_name}")
                     st.markdown(f"- flight_end: {flight_end_name}")
@@ -862,7 +874,7 @@ def build_best_route_patterns(current_st_name: str, ai_info: dict, navitime_rout
 
         time_min = int(60 + ai_info.get("flight_time_min", 150) + (airport_to_dest_km / 40.0 * 60))
 
-        # AI相場検索の運賃に1.3倍マージンを適用
+        # AI相場検索の運賃に1.3倍マージンを適用（flex料金ベース）
         flight_fare = int(ai_info.get("flight_fare_estimate", 60000) * 1.3)
 
         origin_airport = "伊丹空港" if "淀屋橋" in current_st_name else "羽田空港"
@@ -908,13 +920,13 @@ def build_best_route_patterns(current_st_name: str, ai_info: dict, navitime_rout
     base_transport_rental = {}
 
     if selected_mode == "flight":
-        base_transport_taxi["航空券費用(往復・人数分)"] = round_up_1000(flight_fare * 2 * headcount)
-        base_transport_taxi["アクセス電車運賃(往復・人数分・指定席)"] = round_up_1000(access_train_fare * 2 * headcount)
-        base_transport_rental["航空券費用(往復・人数分)"] = round_up_1000(flight_fare * 2 * headcount)
-        base_transport_rental["アクセス電車運賃(往復・人数分・指定席)"] = round_up_1000(access_train_fare * 2 * headcount)
+        base_transport_taxi["航空券費用(往復・人数分・flex)"] = round_up_1000(flight_fare * 2 * headcount)
+        base_transport_taxi["アクセス電車運賃(往復・人数分)"] = round_up_1000(access_train_fare * 2 * headcount)
+        base_transport_rental["航空券費用(往復・人数分・flex)"] = round_up_1000(flight_fare * 2 * headcount)
+        base_transport_rental["アクセス電車運賃(往復・人数分)"] = round_up_1000(access_train_fare * 2 * headcount)
     else:
-        base_transport_taxi["電車・新幹線運賃(往復・人数分・指定席)"] = round_up_1000(navitime_route["total_fare"] * 2 * headcount)
-        base_transport_rental["電車・新幹線運賃(往復・人数分・指定席)"] = round_up_1000(navitime_route["total_fare"] * 2 * headcount)
+        base_transport_taxi["電車・新幹線運賃(往復・人数分)"] = round_up_1000(navitime_route["total_fare"] * 2 * headcount)
+        base_transport_rental["電車・新幹線運賃(往復・人数分)"] = round_up_1000(navitime_route["total_fare"] * 2 * headcount)
 
     # ★ タクシーパターン
     b_taxi = dict(base_transport_taxi)
@@ -994,10 +1006,10 @@ def build_best_route_patterns(current_st_name: str, ai_info: dict, navitime_rout
             st.markdown(f"**除外オプション:** レンタカー={'除外' if no_rental else '有効'}, タクシー={'除外' if no_taxi else '有効'}")
             st.markdown("---")
             if selected_mode == "flight":
-                st.markdown(f"**flight_fare (片道):** {flight_fare:,} 円")
-                st.markdown(f"**access_train_fare (片道・指定席込):** {access_train_fare:,} 円")
+                st.markdown(f"**flight_fare (片道・flex):** {flight_fare:,} 円")
+                st.markdown(f"**access_train_fare (片道):** {access_train_fare:,} 円")
             else:
-                st.markdown(f"**total_fare (片道・指定席込):** {navitime_route['total_fare']:,} 円")
+                st.markdown(f"**total_fare (片道):** {navitime_route['total_fare']:,} 円")
             st.markdown("---")
             if not no_taxi:
                 st.markdown("**タクシーパターン:**")
