@@ -666,6 +666,15 @@ def get_navitime_fastest_route(start_lat, start_lon, goal_lat, goal_lon, navitim
         if sections and sections[-1].get("type") == "move":
             last_walk_min = sections[-1].get("time", 0)
 
+        # [追加] 画面表示用に、実際に通過する全地点（駅・空港）の名前を順番に集める。
+        # Excel出力には使わず、UI上の「詳細ルート」表示にのみ使用する。
+        route_points = []
+        for sec in sections:
+            if sec.get("type") == "point":
+                name = sec.get("name")
+                if name:
+                    route_points.append(name)
+
         result = {
             "has_flight": has_flight,
             "time_min": time_min,
@@ -682,6 +691,7 @@ def get_navitime_fastest_route(start_lat, start_lon, goal_lat, goal_lon, navitim
             "flight_end": flight_end_name,
             "post_flight_start": post_flight_start_name,
             "post_flight_end": post_flight_end_name or end_station_name,
+            "route_points": route_points,
         }
 
         if DEBUG_MODE:
@@ -833,15 +843,18 @@ def build_best_route_patterns(current_st_name, ai_info, navitime_route,
         post_flight_fare = 0
         pre_flight_fare = access_fare
 
+    # [修正] 宿泊数は移動時間の区分に関わらず「作業日数-1泊」を基本とする。
+    # 例: 作業2日 → 1泊（作業日の間だけ泊まる）。
+    # 前泊/後泊が必要なケース（移動4h以上・飛行機利用）でも、
+    # 前泊 or 後泊のどちらか片方のみを想定し、+1 は行わない
+    # （旧: work_days+1 としていたため、作業2日で3泊になってしまっていた）。
     travel_hours = time_min / 60.0
+    nights = max(work_days - 1, 0)
     if selected_mode == "flight" or travel_hours >= 4.0:
-        nights = work_days + 1
         stay_note = "前泊/後泊想定（" + str(nights) + "泊）"
     elif travel_hours >= 2.5:
-        nights = work_days
         stay_note = "宿泊想定（" + str(nights) + "泊）"
     else:
-        nights = max(work_days - 1, 0)
         stay_note = "標準（" + str(nights) + "泊）"
 
     hotel_cost = round_up_1000(HOTEL_COST_PER_NIGHT_PER_PERSON * headcount * nights)
