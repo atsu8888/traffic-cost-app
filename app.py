@@ -49,11 +49,7 @@ RETRYABLE_STATUS_CODES = {429, 503}
 DEBUG_MODE = True
 
 # テンプレートファイル
-# 同じ階層に置く場合のデフォルトファイル名候補（見つかった最初のものを使う）
-TEMPLATE_FILE_CANDIDATES = [
-    "交通費見積_テンプレート.xlsx",
-    "見積指標_CSI_SSI_TIS__r1_-_コヒ_ー_2.xlsx",
-]
+# 同じ階層のxlsxはファイル名を問わず自動探索するため、固定ファイル名の指定は不要
 TEMPLATE_SHEET_NAME = "交通費"
 
 
@@ -86,31 +82,69 @@ def resolve_template_bytes():
     2. secrets.toml の [template] github_raw_url で指定されたGitHub上のファイル
     3. 同じ階層にある既知のファイル名候補（ローカル運用向けのフォールバック）
     4. どれもなければ None（呼び出し側でエラー表示）
+
+    戻り値: (bytes|None, source: str, log: list[str])
     """
+    log = []
+
     uploaded = st.session_state.get("template_bytes")
     if uploaded:
-        return uploaded
+        log.append("サイドバーで手動アップロードされたファイルを使用")
+        return uploaded, "manual_upload", log
 
     try:
-        github_url = st.secrets.get("template", {}).get("github_raw_url", "")
-        github_token = st.secrets.get("template", {}).get("github_token", "")
-    except Exception:
-        github_url, github_token = "", ""
+        template_secrets = st.secrets.get("template", {})
+    except Exception as e:
+        template_secrets = {}
+        log.append(f"st.secrets読み込み自体に失敗: {e}")
+
+    github_url = template_secrets.get("github_raw_url", "") if template_secrets else ""
+    github_token = template_secrets.get("github_token", "") if template_secrets else ""
+
+    if not template_secrets:
+        log.append("secrets.tomlに [template] セクションが見つかりません（未設定）")
+    elif not github_url:
+        log.append("secrets.tomlの [template] に github_raw_url が見つかりません（キー名の誤字の可能性）")
 
     if github_url:
+        log.append(f"GitHub raw URLを検出: {github_url}")
         try:
-            return fetch_template_from_github(github_url, github_token)
+            content = fetch_template_from_github(github_url, github_token)
+            log.append("GitHubからの取得に成功")
+            return content, "github", log
         except Exception as e:
-            st.warning(f"GitHubからのテンプレート取得に失敗（ローカルファイルにフォールバック）: {e}")
+            log.append(f"GitHubからの取得に失敗: {e}")
 
-    import os
+    import os, glob
     base_dir = os.path.dirname(os.path.abspath(__file__))
-    for name in TEMPLATE_FILE_CANDIDATES:
-        path = os.path.join(base_dir, name)
-        if os.path.exists(path):
+    xlsx_paths = sorted(glob.glob(os.path.join(base_dir, "*.xlsx")))
+    log.append(f"{base_dir} 内で見つかった .xlsx ファイル: "
+               f"{[os.path.basename(p) for p in xlsx_paths] if xlsx_paths else '(なし)'}")
+
+    for path in xlsx_paths:
+        try:
+            wb_check = openpyxl.load_workbook(path, read_only=True)
+            sheetnames = wb_check.sheetnames
+            wb_check.close()
+        except Exception as e:
+            log.append(f"「{os.path.basename(path)}」の読み込みに失敗: {e}")
+            continue
+        if TEMPLATE_SHEET_NAME in sheetnames:
+            log.append(f"「{TEMPLATE_SHEET_NAME}」シートを含むファイルを採用: {os.path.basename(path)}")
             with open(path, "rb") as f:
-                return f.read()
-    return None
+                return f.read(), "local_file", log
+        else:
+            log.append(f"「{os.path.basename(path)}」に「{TEMPLATE_SHEET_NAME}」シートが無いためスキップ"
+                       f"（シート一覧: {sheetnames}）")
+
+    if not xlsx_paths:
+        log.append(
+            "同じフォルダに.xlsxが1つも見つかりません。GitHubリポジトリ上でapp.pyと"
+            "同じディレクトリにテンプレートxlsxをコミットし、Streamlit Cloud側で"
+            "再デプロイ（Reboot）されているか確認してください。"
+        )
+
+    return None, "none", log
 
 
 # ============================================================
@@ -883,20 +917,20 @@ with st.sidebar:
 
     if st.session_state.get("template_bytes"):
         st.caption("✅ 手動アップロードしたテンプレートを使用中")
-    else:
-        try:
-            _gh_url = st.secrets.get("template", {}).get("github_raw_url", "")
-        except Exception:
-            _gh_url = ""
-        if _gh_url:
-            st.caption(f"🔗 GitHubから取得: `{_gh_url.split('/')[-1]}`")
-        else:
-            st.caption("💻 ローカルファイル / 未設定")
 
-    resolved_template = resolve_template_bytes()
-    if not resolved_template:
-        st.caption("⚠️ テンプレートが見つかりません：上のアップローダーから設定するか、"
-                    "secrets.tomlに [template] github_raw_url を設定してください")
+    _resolved_bytes, _source, _log = resolve_template_bytes()
+    if _source == "github":
+        st.caption("🔗 GitHubから取得済み")
+    elif _source == "local_file":
+        st.caption("💻 ローカルファイルから取得済み")
+    elif _source == "manual_upload":
+        pass  # 上ですでに表示済み
+    else:
+        st.caption("⚠️ テンプレートが見つかりません")
+
+    with st.expander("🔍 テンプレート取得ログ", expanded=(_source == "none")):
+        for line in _log:
+            st.caption(f"・{line}")
 
 col1, col2 = st.columns([2, 1])
 with col1:
@@ -991,11 +1025,12 @@ if st.button("見積もりを計算する", type="primary"):
                     with st.expander("🔍 [DEBUG] excel_data", expanded=False):
                         st.json(p.get("excel_data", {}))
 
+                _tpl_bytes, _tpl_source, _tpl_log = resolve_template_bytes()
                 try:
                     excel_bytes = create_excel_report(
                         p, ai_info.get('normalized_address', address_input),
                         headcount, work_days, current_st_name,
-                        template_bytes=resolve_template_bytes())
+                        template_bytes=_tpl_bytes)
                     st.download_button(
                         label="Excel見積書をダウンロード",
                         data=excel_bytes,
@@ -1004,4 +1039,7 @@ if st.button("見積もりを計算する", type="primary"):
                         key=f"dl_{current_st_name}_{p['type']}")
                 except (FileNotFoundError, ValueError) as e:
                     st.error(f"Excel出力エラー: {e}")
+                    with st.expander("🔍 テンプレート取得ログ（原因確認用）", expanded=True):
+                        for line in _tpl_log:
+                            st.caption(f"・{line}")
         st.markdown("---")
