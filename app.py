@@ -2,6 +2,20 @@
 """
 交通費・出張見積もりアプリ（Streamlit Cloud公開版）
 テンプレートExcelに値を書き込む方式。
+
+[修正履歴]
+- get_navitime_fastest_route: 運賃計算で unit_0 + unit_3 を合算していたバグを修正。
+  NAVITIMEのfareオブジェクトは支払い方法・料金体系ごとに複数の組が並列で入っており、
+  単純に足し合わせてよいものではない。NAVITIMEが提供する reference_fare
+  (lowest_total_ticket / lowest_total_ic) を最優先で採用し、無ければ
+  unit_0（運賃）+ unit_1（特急料金）の正しい組み合わせにフォールバックする。
+  （旧: unit_0 + unit_3 → 無関係な料金体系同士を合算し、実際より高い金額になっていた）
+- build_best_route_patterns: excel_data に詰める運賃が「片道」のままだったバグを修正。
+  Excelテンプレートの行9〜11は「電車・新幹線（往復）」「飛行機（往復）」等、
+  いずれも往復を前提としたラベルであり、Q列の合計式（=M×O×P）は
+  「M(=N の切り上げ)に往復1人分の運賃が入っている」前提で人数(P)を掛けているだけ。
+  往復を意味する係数がテンプレート側のどこにも存在しないため、
+  Python側で片道運賃を明示的に2倍してから書き込む必要がある。
 """
 
 import json
@@ -577,20 +591,23 @@ def get_navitime_fastest_route(start_lat, start_lon, goal_lat, goal_lon, navitim
                 if sec_type == "move":
                     transport = sec.get("transport", {})
                     sec_fare = 0
+                    # [修正] unit_3 ではなく unit_1（運賃(unit_0)と組み合わせて使う
+                    # 特急・新幹線料金）を使う。unit_3 は別の料金体系(切符種別)の値で、
+                    # unit_0 と単純に足すと無関係な組み合わせになり過大になる。
                     if transport and "fare" in transport and isinstance(transport["fare"], dict):
                         sec_fare = int(transport["fare"].get("unit_0", 0))
-                        sec_unit_3 = int(transport["fare"].get("unit_3", 0))
+                        sec_unit_1 = int(transport["fare"].get("unit_1", 0))
                     else:
-                        sec_unit_3 = 0
+                        sec_unit_1 = 0
 
                     if i < flight_section_idx:
-                        pre_flight_fare += sec_fare + sec_unit_3
+                        pre_flight_fare += sec_fare + sec_unit_1
                         if m_type in ("superexpress_train",):
                             pre_flight_has_superexpress = True
                     elif i == flight_section_idx:
                         flight_fare = sec_fare
                     else:
-                        post_flight_fare += sec_fare + sec_unit_3
+                        post_flight_fare += sec_fare + sec_unit_1
                         if m_type in ("superexpress_train",):
                             post_flight_has_superexpress = True
 
@@ -618,9 +635,22 @@ def get_navitime_fastest_route(start_lat, start_lon, goal_lat, goal_lon, navitim
 
         else:
             fare_dict = move_info.get("fare", {})
-            fare_unit_0 = fare_dict.get("unit_0", 0) if isinstance(fare_dict, dict) else 0
-            fare_unit_3 = fare_dict.get("unit_3", 0) if isinstance(fare_dict, dict) else 0
-            pre_flight_fare = int(fare_unit_0 + fare_unit_3) if has_superexpress else int(fare_unit_0)
+            reference_fare = fare_dict.get("reference_fare", {}) if isinstance(fare_dict, dict) else {}
+
+            # [修正] NAVITIME自身が算出した合計運賃(reference_fare)を最優先で使う。
+            # これが最も信頼できる「実際に乗車した場合の合計運賃」。
+            lowest_ic = reference_fare.get("lowest_total_ic") if isinstance(reference_fare, dict) else None
+            lowest_ticket = reference_fare.get("lowest_total_ticket") if isinstance(reference_fare, dict) else None
+
+            if lowest_ic or lowest_ticket:
+                pre_flight_fare = int(lowest_ic or lowest_ticket)
+            else:
+                # フォールバック: 運賃(unit_0) + 特急・新幹線料金(unit_1) の組み合わせ。
+                # 旧コードは unit_0 + unit_3 を合算しており、無関係な料金体系同士を
+                # 足してしまい実際より高い金額になるバグがあった。
+                fare_unit_0 = fare_dict.get("unit_0", 0) if isinstance(fare_dict, dict) else 0
+                fare_unit_1 = fare_dict.get("unit_1", 0) if isinstance(fare_dict, dict) else 0
+                pre_flight_fare = int(fare_unit_0 + fare_unit_1) if has_superexpress else int(fare_unit_0)
 
             for sec in sections:
                 if sec.get("type") == "point":
@@ -666,7 +696,7 @@ def get_navitime_fastest_route(start_lat, start_lon, goal_lat, goal_lon, navitim
                     st.markdown(f"**空港:** {flight_start_name} → {flight_end_name}")
                     st.markdown(f"**後区間駅:** {post_flight_start_name} → {post_flight_end_name}")
                 else:
-                    st.markdown(f"**運賃合計:** {pre_flight_fare:,} 円")
+                    st.markdown(f"**運賃合計(片道):** {pre_flight_fare:,} 円")
                 st.json(result)
         return result
     except Exception as e:
@@ -710,28 +740,33 @@ def build_best_route_patterns(current_st_name, ai_info, navitime_route,
             # 行11=（到着側アクセス電車）＝到着空港→最終駅（post_flight）
             # という並び順がテンプレートの実際のレイアウトなので、
             # train(行9)にはpre_flight、access(行11)にはpost_flightを入れる
-            # （従来コードはここが入れ替わっており、出発側と到着後の経路・運賃が
-            #  逆のセルに書き込まれるバグがあった）
+            #
+            # [修正] さらに、NAVITIMEの片道検索結果である
+            # pre_flight_fare / flight_fare / post_flight_fare を
+            # そのままExcelのN列に書き込むと「片道」の金額になってしまう。
+            # テンプレートの行ラベルはいずれも「（往復）」であり、
+            # Q列の合計式(=M×O×P)は「Mに往復1人分の運賃が入っている」前提で
+            # 人数(P)しか掛けていないため、往復分の×2はここで明示的に行う。
             excel_data = {
                 "train": {
                     "used": pre_flight_fare > 0,
                     "from": current_st_name.replace("駅", ""),
                     "to": origin_airport,
-                    "fare": pre_flight_fare,
+                    "fare": pre_flight_fare * 2,
                     "time_h": "",
                 },
                 "flight": {
                     "used": True,
                     "from": origin_airport,
                     "to": dest_airport,
-                    "fare": flight_fare,
+                    "fare": flight_fare * 2,
                     "time_h": time_hours if (time_hours := round(time_min / 60.0, 1)) else "",
                 },
                 "access": {
                     "used": post_flight_fare > 0,
                     "from": post_start,
                     "to": post_end,
-                    "fare": post_flight_fare,
+                    "fare": post_flight_fare * 2,
                 },
             }
             is_ai_fare = False
@@ -742,12 +777,14 @@ def build_best_route_patterns(current_st_name, ai_info, navitime_route,
             route_title = f"🚄 電車ルート ({end_st}着)"
             display_route_str = f"{current_st_name} ➔ {end_st} ➔ 目的地"
 
+            # [修正] total_fare はNAVITIMEの片道検索結果（片道運賃）。
+            # 行9「電車・新幹線（往復）」に書き込むため、明示的に2倍して往復運賃にする。
             excel_data = {
                 "train": {
                     "used": True,
                     "from": current_st_name,
                     "to": end_st,
-                    "fare": total_fare,
+                    "fare": total_fare * 2,
                     "time_h": round(time_min / 60.0, 1),
                 },
                 "flight": {"used": False},
@@ -774,20 +811,22 @@ def build_best_route_patterns(current_st_name, ai_info, navitime_route,
         route_title = f"✈️ 飛行機ルート ({airport_name}利用)"
         display_route_str = f"{current_st_name} ➔ {origin_airport} ➔ {airport_name} ➔ 目的地"
 
+        # [修正] flight_fare / access_fare も片道相当の値なので、
+        # Excelの「（往復）」欄に書き込む際は2倍する。
         excel_data = {
             "train": {"used": False},
             "flight": {
                 "used": True,
                 "from": origin_airport,
                 "to": airport_name,
-                "fare": flight_fare,
+                "fare": flight_fare * 2,
                 "time_h": round(time_min / 60.0, 1),
             },
             "access": {
                 "used": access_fare > 0,
                 "from": current_st_name.replace("駅", ""),
                 "to": origin_airport,
-                "fare": access_fare,
+                "fare": access_fare * 2,
             },
         }
         is_ai_fare = True
