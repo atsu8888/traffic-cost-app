@@ -48,8 +48,69 @@ RETRY_WAIT_SECONDS = [5, 15, 30]
 RETRYABLE_STATUS_CODES = {429, 503}
 DEBUG_MODE = True
 
-# テンプレートファイル（同じ階層に配置）
-TEMPLATE_FILE = "交通費見積_テンプレート.xlsx"
+# テンプレートファイル
+# 同じ階層に置く場合のデフォルトファイル名候補（見つかった最初のものを使う）
+TEMPLATE_FILE_CANDIDATES = [
+    "交通費見積_テンプレート.xlsx",
+    "見積指標_CSI_SSI_TIS__r1_-_コヒ_ー_2.xlsx",
+]
+TEMPLATE_SHEET_NAME = "交通費"
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_template_from_github(raw_url: str, token: str = ""):
+    """
+    GitHub上のテンプレートExcelを取得する。
+    raw_url は raw.githubusercontent.com 形式のURL
+      例: https://raw.githubusercontent.com/<owner>/<repo>/<branch>/<path>/xxx.xlsx
+    プライベートリポジトリの場合は token（GitHub Personal Access Token, repo権限）を渡すと
+    Authorization ヘッダ付きで取得する。
+    st.cache_data により、同一URLへの再取得は10分間キャッシュされる。
+    """
+    headers = {}
+    if token:
+        headers["Authorization"] = f"token {token}"
+    res = requests.get(raw_url, headers=headers, timeout=15)
+    if res.status_code != 200:
+        raise ValueError(
+            f"GitHubからのテンプレート取得に失敗しました（HTTP {res.status_code}）。"
+            f"URLが正しいか、プライベートリポジトリならトークンが正しいか確認してください。\nURL: {raw_url}"
+        )
+    return res.content
+
+
+def resolve_template_bytes():
+    """
+    テンプレートExcelのバイト列を取得する。優先順位:
+    1. サイドバーで手動アップロードされたもの（session_state）
+    2. secrets.toml の [template] github_raw_url で指定されたGitHub上のファイル
+    3. 同じ階層にある既知のファイル名候補（ローカル運用向けのフォールバック）
+    4. どれもなければ None（呼び出し側でエラー表示）
+    """
+    uploaded = st.session_state.get("template_bytes")
+    if uploaded:
+        return uploaded
+
+    try:
+        github_url = st.secrets.get("template", {}).get("github_raw_url", "")
+        github_token = st.secrets.get("template", {}).get("github_token", "")
+    except Exception:
+        github_url, github_token = "", ""
+
+    if github_url:
+        try:
+            return fetch_template_from_github(github_url, github_token)
+        except Exception as e:
+            st.warning(f"GitHubからのテンプレート取得に失敗（ローカルファイルにフォールバック）: {e}")
+
+    import os
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    for name in TEMPLATE_FILE_CANDIDATES:
+        path = os.path.join(base_dir, name)
+        if os.path.exists(path):
+            with open(path, "rb") as f:
+                return f.read()
+    return None
 
 
 # ============================================================
@@ -179,51 +240,40 @@ def parse_json_from_text(text):
 
 # ============================================================
 # Excel出力（テンプレート方式）
-#
-# テンプレートのセル配置:
-#   C3: 住所
-#   C4: 人数
-#   C5: 作業日数
-#   C6: =IF(R15>=4,1,0)  ← 数式のまま
-#   B9:  チェック（電車・新幹線）
-#   B10: チェック（飛行機）
-#   B11: チェック（アクセス電車）
-#   B12: チェック（レンタカー）
-#   B13: チェック（タクシー）
-#   B14: チェック（宿泊）
-#   H9〜K9: 経路（電車）
-#   H10〜K10: 経路（飛行機）
-#   H11〜K11: 経路（アクセス電車）
-#   N9〜N14: 実費用
-#   O9〜O14: 日数・泊数
-#   R9〜R14: 片路移動時間
-#   Row 15: 合計行（数式のまま）
-#   Row 17〜31: 下見作業セクション
 # ============================================================
 
-def create_excel_report(pattern_data, address, headcount, work_days, origin_station):
+def create_excel_report(pattern_data, address, headcount, work_days, origin_station, template_bytes):
     """テンプレートExcelを読み込み、値のみ書き込んで返す"""
-    wb = openpyxl.load_workbook(TEMPLATE_FILE)
-    ws = wb["交通費"]
+    if not template_bytes:
+        raise FileNotFoundError(
+            "テンプレートExcelが見つかりません。サイドバーの「テンプレートExcelをアップロード」から"
+            "テンプレートファイル（交通費シートを含むxlsx）を一度アップロードしてください。"
+        )
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(template_bytes))
+    except Exception as e:
+        raise ValueError(f"テンプレートExcelの読み込みに失敗しました（壊れたファイルの可能性）: {e}")
 
-    # --- 基本情報 ---
+    if TEMPLATE_SHEET_NAME not in wb.sheetnames:
+        raise ValueError(
+            f"テンプレートExcelに「{TEMPLATE_SHEET_NAME}」シートが見つかりません。"
+            f"シート一覧: {wb.sheetnames}"
+        )
+    ws = wb[TEMPLATE_SHEET_NAME]
+
     ws['C3'] = address
     ws['C4'] = headcount
     ws['C5'] = work_days
-    # C6は数式（=IF(R15>=4,1,0)）のままなので触らない
 
-    # --- パターンデータ取得 ---
     excel_data = pattern_data.get("excel_data", {})
     time_hours = round(pattern_data.get("time_min", 0) / 60.0, 1)
     stay_note = pattern_data.get("note", "")
 
-    # 宿泊泊数
     nights = 0
     match_nights = re.search(r'(\d+)泊', stay_note)
     if match_nights:
         nights = int(match_nights.group(1))
 
-    # --- Row 9: 電車・新幹線（往復） ---
     train = excel_data.get("train", {})
     if train.get("used"):
         ws['B9'] = "✓"
@@ -240,7 +290,6 @@ def create_excel_report(pattern_data, address, headcount, work_days, origin_stat
         ws['O9'] = 1
         ws['R9'] = ""
 
-    # --- Row 10: 飛行機（往復） ---
     flight = excel_data.get("flight", {})
     if flight.get("used"):
         ws['B10'] = "✓"
@@ -257,7 +306,6 @@ def create_excel_report(pattern_data, address, headcount, work_days, origin_stat
         ws['O10'] = 1
         ws['R10'] = ""
 
-    # --- Row 11: 電車・新幹線（アクセス） ---
     access = excel_data.get("access", {})
     if access.get("used"):
         ws['B11'] = "✓"
@@ -274,11 +322,10 @@ def create_excel_report(pattern_data, address, headcount, work_days, origin_stat
         ws['O11'] = 1
         ws['R11'] = ""
 
-    # --- Row 12: レンタカー ---
     rental = excel_data.get("rental", {})
     if rental.get("used"):
         ws['B12'] = "✓"
-        ws['N12'] = 0  # M列に12000固定なのでN列は0
+        ws['N12'] = 0
         ws['O12'] = rental.get("days", 1)
         ws['R12'] = 1
     else:
@@ -287,17 +334,14 @@ def create_excel_report(pattern_data, address, headcount, work_days, origin_stat
         ws['O12'] = 1
         ws['R12'] = ""
 
-    # --- Row 13: タクシー（往復） ---
     taxi = excel_data.get("taxi", {})
     if taxi.get("used"):
         ws['B13'] = "✓"
         ws['N13'] = taxi.get("fare_per_trip", 0)
-        # O13は数式（=C5+C6）のままにする
     else:
         ws['B13'] = "-"
         ws['N13'] = 0
 
-    # --- Row 14: 宿泊 ---
     hotel = excel_data.get("hotel", {})
     if hotel.get("used"):
         ws['B14'] = "✓"
@@ -306,14 +350,6 @@ def create_excel_report(pattern_data, address, headcount, work_days, origin_stat
         ws['B14'] = "-"
         ws['O14'] = 0
 
-    # --- 片路移動時間の設定 ---
-    # 飛行機ルートの場合、R列は飛行機行に時間を入れる
-    # 電車のみの場合、R9に時間を入れる
-    # ※上で既に設定済み
-
-    # --- 下見作業セクション (Row 25-30) ---
-    # 下見は設置作業の値を参照する数式が入っているので基本触らない
-    # ただしチェックは設置作業と同じにする
     ws['B25'] = ws['B9'].value or "-"
     ws['B26'] = ws['B10'].value or "-"
     ws['B27'] = ws['B11'].value or "-"
@@ -392,10 +428,6 @@ def analyze_destination_with_gemini(raw_address, gemini_key, origin_name):
     return fallback_data
 
 
-# ============================================================
-# STEP 1.5: 離島 → Gemini + Google Search
-# ============================================================
-
 def search_flight_fare_with_gemini(raw_address, airport_name, gemini_key, origin_name):
     client = genai.Client(api_key=gemini_key.strip())
     origin_city = "大阪" if "淀屋橋" in origin_name else "東京"
@@ -430,10 +462,6 @@ def search_flight_fare_with_gemini(raw_address, airport_name, gemini_key, origin
         retry_placeholder.empty()
     return fallback_data
 
-
-# ============================================================
-# STEP 2: NAVITIME API（3区間分離対応）
-# ============================================================
 
 def get_navitime_fastest_route(start_lat, start_lon, goal_lat, goal_lon, navitime_key,
                                no_flight=False, no_shinkansen=False):
@@ -472,36 +500,31 @@ def get_navitime_fastest_route(start_lat, start_lon, goal_lat, goal_lon, navitim
 
         sections = fastest.get("sections", [])
 
-        # --- 3区間分離ロジック ---
         has_flight = False
         flight_section_idx = -1
 
-        # まず飛行機セクションを探す
         for i, sec in enumerate(sections):
             if sec.get("type") == "move" and sec.get("move", "").lower() in FLIGHT_MOVE_TYPES:
                 has_flight = True
                 flight_section_idx = i
                 break
 
-        # 各セクションの運賃を集計
-        pre_flight_fare = 0    # 出発駅→出発空港
-        flight_fare = 0        # 飛行機
-        post_flight_fare = 0   # 到着空港→最終駅
+        pre_flight_fare = 0
+        flight_fare = 0
+        post_flight_fare = 0
         pre_flight_has_superexpress = False
         post_flight_has_superexpress = False
 
-        # 駅名の取得用
         start_station_name = None
         end_station_name = None
         end_station_lat = None
         end_station_lon = None
-        flight_start_name = None  # 出発空港
-        flight_end_name = None    # 到着空港
-        post_flight_start_name = None  # 到着空港の次の駅
-        post_flight_end_name = None    # 最終駅
+        flight_start_name = None
+        flight_end_name = None
+        post_flight_start_name = None
+        post_flight_end_name = None
 
         if has_flight:
-            # 飛行機前後で分離
             for i, sec in enumerate(sections):
                 sec_type = sec.get("type", "")
                 m_type = sec.get("move", "").lower()
@@ -509,7 +532,6 @@ def get_navitime_fastest_route(start_lat, start_lon, goal_lat, goal_lon, navitim
                 if sec_type == "point":
                     if not start_station_name:
                         start_station_name = sec.get("name")
-                    # 飛行機の直前のpoint = 出発空港
                     if i < flight_section_idx and sections[i + 1] if i + 1 < len(sections) else None:
                         pass
                     if "goal" not in sec.get("name", "").lower():
@@ -528,20 +550,16 @@ def get_navitime_fastest_route(start_lat, start_lon, goal_lat, goal_lon, navitim
                         sec_unit_3 = 0
 
                     if i < flight_section_idx:
-                        # 飛行機前（出発駅→出発空港）
                         pre_flight_fare += sec_fare + sec_unit_3
                         if m_type in ("superexpress_train",):
                             pre_flight_has_superexpress = True
                     elif i == flight_section_idx:
-                        # 飛行機本体
                         flight_fare = sec_fare
                     else:
-                        # 飛行機後（到着空港→最終駅）
                         post_flight_fare += sec_fare + sec_unit_3
                         if m_type in ("superexpress_train",):
                             post_flight_has_superexpress = True
 
-            # 空港名の取得
             for i in range(flight_section_idx - 1, -1, -1):
                 if sections[i].get("type") == "point":
                     flight_start_name = sections[i].get("name")
@@ -551,7 +569,6 @@ def get_navitime_fastest_route(start_lat, start_lon, goal_lat, goal_lon, navitim
                     flight_end_name = sections[i].get("name")
                     break
 
-            # 到着空港以降の駅名
             found_flight_end = False
             for i in range(flight_section_idx + 1, len(sections)):
                 if sections[i].get("type") == "point":
@@ -566,7 +583,6 @@ def get_navitime_fastest_route(start_lat, start_lon, goal_lat, goal_lon, navitim
                                 end_station_lon = sections[i]["coord"].get("lon")
 
         else:
-            # 飛行機なし → 全体をtrain扱い
             fare_dict = move_info.get("fare", {})
             fare_unit_0 = fare_dict.get("unit_0", 0) if isinstance(fare_dict, dict) else 0
             fare_unit_3 = fare_dict.get("unit_3", 0) if isinstance(fare_dict, dict) else 0
@@ -582,7 +598,6 @@ def get_navitime_fastest_route(start_lat, start_lon, goal_lat, goal_lon, navitim
                             end_station_lat = sec["coord"].get("lat")
                             end_station_lon = sec["coord"].get("lon")
 
-        # 最終徒歩時間
         last_walk_min = 0
         if sections and sections[-1].get("type") == "move":
             last_walk_min = sections[-1].get("time", 0)
@@ -590,21 +605,19 @@ def get_navitime_fastest_route(start_lat, start_lon, goal_lat, goal_lon, navitim
         result = {
             "has_flight": has_flight,
             "time_min": time_min,
-            # 3区間分離
-            "pre_flight_fare": int(pre_flight_fare),      # 出発駅→出発空港（電車）
-            "flight_fare": int(flight_fare),              # 飛行機
-            "post_flight_fare": int(post_flight_fare),    # 到着空港→最終駅（新幹線/電車）
-            # 飛行機なしの場合はpre_flight_fareに全額入る
+            "pre_flight_fare": int(pre_flight_fare),
+            "flight_fare": int(flight_fare),
+            "post_flight_fare": int(post_flight_fare),
             "total_fare": int(pre_flight_fare + flight_fare + post_flight_fare),
             "last_walk_min": last_walk_min,
             "start_station": start_station_name or "出発駅",
             "end_station": end_station_name or "到着駅",
             "end_station_lat": end_station_lat,
             "end_station_lon": end_station_lon,
-            "flight_start": flight_start_name,   # 出発空港名
-            "flight_end": flight_end_name,       # 到着空港名
-            "post_flight_start": post_flight_start_name,  # 到着空港
-            "post_flight_end": post_flight_end_name or end_station_name,  # 最終駅
+            "flight_start": flight_start_name,
+            "flight_end": flight_end_name,
+            "post_flight_start": post_flight_start_name,
+            "post_flight_end": post_flight_end_name or end_station_name,
         }
 
         if DEBUG_MODE:
@@ -626,10 +639,6 @@ def get_navitime_fastest_route(start_lat, start_lon, goal_lat, goal_lon, navitim
         st.warning(f"NAVITIME エラー: {e}")
         return None
 
-
-# ============================================================
-# STEP 3: パターン生成（3区間分離対応）
-# ============================================================
 
 def build_best_route_patterns(current_st_name, ai_info, navitime_route,
                               headcount, work_days, no_rental=False, no_taxi=False):
@@ -662,13 +671,19 @@ def build_best_route_patterns(current_st_name, ai_info, navitime_route,
             route_title = f"✈️ 飛行機ルート ({dest_airport}経由)"
             display_route_str = f"{current_st_name} ➔ {origin_airport} ➔ {dest_airport} ➔ {end_st} ➔ 目的地"
 
-            # Excel用データ（3区間分離）
+            # 行9=「電車・新幹線（往復）」＝出発駅→出発空港（pre_flight）
+            # 行10=「飛行機（往復）」
+            # 行11=（到着側アクセス電車）＝到着空港→最終駅（post_flight）
+            # という並び順がテンプレートの実際のレイアウトなので、
+            # train(行9)にはpre_flight、access(行11)にはpost_flightを入れる
+            # （従来コードはここが入れ替わっており、出発側と到着後の経路・運賃が
+            #  逆のセルに書き込まれるバグがあった）
             excel_data = {
                 "train": {
-                    "used": post_flight_fare > 0,
-                    "from": post_start,
-                    "to": post_end,
-                    "fare": post_flight_fare,  # 到着空港→最終駅（往復1人分片道）
+                    "used": pre_flight_fare > 0,
+                    "from": current_st_name.replace("駅", ""),
+                    "to": origin_airport,
+                    "fare": pre_flight_fare,
                     "time_h": "",
                 },
                 "flight": {
@@ -679,10 +694,10 @@ def build_best_route_patterns(current_st_name, ai_info, navitime_route,
                     "time_h": time_hours if (time_hours := round(time_min / 60.0, 1)) else "",
                 },
                 "access": {
-                    "used": pre_flight_fare > 0,
-                    "from": current_st_name.replace("駅", ""),
-                    "to": origin_airport,
-                    "fare": pre_flight_fare,
+                    "used": post_flight_fare > 0,
+                    "from": post_start,
+                    "to": post_end,
+                    "fare": post_flight_fare,
                 },
             }
             is_ai_fare = False
@@ -706,7 +721,6 @@ def build_best_route_patterns(current_st_name, ai_info, navitime_route,
             }
             is_ai_fare = False
     else:
-        # 離島（NAVITIMEなし）
         selected_mode = "flight"
         airport_name = ai_info.get("nearest_airport_name", "最寄り空港")
         airport_lat = ai_info.get("airport_lat", 0)
@@ -746,7 +760,6 @@ def build_best_route_patterns(current_st_name, ai_info, navitime_route,
         post_flight_fare = 0
         pre_flight_fare = access_fare
 
-    # 宿泊判定
     travel_hours = time_min / 60.0
     if selected_mode == "flight" or travel_hours >= 4.0:
         nights = work_days + 1
@@ -758,7 +771,6 @@ def build_best_route_patterns(current_st_name, ai_info, navitime_route,
         nights = max(work_days - 1, 0)
         stay_note = "標準（" + str(nights) + "泊）"
 
-    # 費用計算
     hotel_cost = round_up_1000(HOTEL_COST_PER_NIGHT_PER_PERSON * headcount * nights)
     rental_days = work_days + (1 if "前泊" in stay_note else 0)
     rental_car_total = round_up_1000(RENTAL_CAR_COST_PER_DAY * rental_days)
@@ -766,7 +778,6 @@ def build_best_route_patterns(current_st_name, ai_info, navitime_route,
     taxi_trips = nights + 1
     taxi_total = round_up_1000(taxi_one_way * 2 * taxi_trips)
 
-    # 交通費の基本部分
     base_transport = {}
     if selected_mode == "flight":
         base_transport["航空券費用(往復・人数分・flex)"] = round_up_1000(flight_fare * 2 * headcount)
@@ -779,20 +790,17 @@ def build_best_route_patterns(current_st_name, ai_info, navitime_route,
     else:
         base_transport["電車・新幹線運賃(往復・人数分)"] = round_up_1000(navitime_route["total_fare"] * 2 * headcount)
 
-    # タクシーパターン
     b_taxi = dict(base_transport)
     if taxi_total > 0:
         b_taxi["現地タクシー運賃(往復x" + str(taxi_trips) + "回)"] = taxi_total
     b_taxi["宿泊費"] = hotel_cost
     taxi_sum = sum(b_taxi.values())
 
-    # レンタカーパターン
     b_rental = dict(base_transport)
     b_rental["レンタカー費用(12000円x" + str(rental_days) + "日)"] = rental_car_total
     b_rental["宿泊費"] = hotel_cost
     rental_sum = sum(b_rental.values())
 
-    # Excel用: レンタカー/タクシー情報
     if no_taxi and no_rental:
         final_breakdown = dict(base_transport)
         final_breakdown["宿泊費"] = hotel_cost
@@ -836,7 +844,6 @@ def build_best_route_patterns(current_st_name, ai_info, navitime_route,
             excel_data["rental"] = {"used": False}
             excel_data["taxi"] = {"used": taxi_total > 0, "fare_per_trip": round_up_1000(taxi_one_way * 2)}
 
-    # 宿泊
     excel_data["hotel"] = {"used": nights > 0, "nights": nights}
 
     if is_ai_fare:
@@ -863,6 +870,33 @@ if DEBUG_MODE:
     st.caption("🐛 デバッグモード ON")
 
 gemini_api_key, navitime_api_key = get_api_keys()
+
+with st.sidebar:
+    st.markdown("### 📄 Excelテンプレート")
+    tpl_file = st.file_uploader(
+        "テンプレートExcelを手動アップロード（未設定の場合や上書きしたい場合）",
+        type=["xlsx"],
+        key="template_uploader",
+    )
+    if tpl_file is not None:
+        st.session_state["template_bytes"] = tpl_file.getvalue()
+
+    if st.session_state.get("template_bytes"):
+        st.caption("✅ 手動アップロードしたテンプレートを使用中")
+    else:
+        try:
+            _gh_url = st.secrets.get("template", {}).get("github_raw_url", "")
+        except Exception:
+            _gh_url = ""
+        if _gh_url:
+            st.caption(f"🔗 GitHubから取得: `{_gh_url.split('/')[-1]}`")
+        else:
+            st.caption("💻 ローカルファイル / 未設定")
+
+    resolved_template = resolve_template_bytes()
+    if not resolved_template:
+        st.caption("⚠️ テンプレートが見つかりません：上のアップローダーから設定するか、"
+                    "secrets.tomlに [template] github_raw_url を設定してください")
 
 col1, col2 = st.columns([2, 1])
 with col1:
@@ -957,14 +991,17 @@ if st.button("見積もりを計算する", type="primary"):
                     with st.expander("🔍 [DEBUG] excel_data", expanded=False):
                         st.json(p.get("excel_data", {}))
 
-                excel_bytes = create_excel_report(
-                    p, ai_info.get('normalized_address', address_input),
-                    headcount, work_days, current_st_name)
-                st.download_button(
-                    label="Excel見積書をダウンロード",
-                    data=excel_bytes,
-                    file_name=f"交通費見積_{current_st_name}発_{address_input[:10]}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key=f"dl_{current_st_name}_{p['type']}")
+                try:
+                    excel_bytes = create_excel_report(
+                        p, ai_info.get('normalized_address', address_input),
+                        headcount, work_days, current_st_name,
+                        template_bytes=resolve_template_bytes())
+                    st.download_button(
+                        label="Excel見積書をダウンロード",
+                        data=excel_bytes,
+                        file_name=f"交通費見積_{current_st_name}発_{address_input[:10]}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key=f"dl_{current_st_name}_{p['type']}")
+                except (FileNotFoundError, ValueError) as e:
+                    st.error(f"Excel出力エラー: {e}")
         st.markdown("---")
-
