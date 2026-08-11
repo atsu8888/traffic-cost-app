@@ -231,6 +231,34 @@ def haversine_km(lat1, lon1, lat2, lon2):
     return 2 * r * math.asin(math.sqrt(a))
 
 
+def build_detailed_route_string(route_points, current_st_name):
+    """
+    [追加] NAVITIMEの区間ごとの地点名(route_points)から、画面表示用の
+    詳細ルート文字列を組み立てる（例: 淀屋橋駅 ➔ 伊丹空港 ➔ 羽田空港 ➔ ... ➔ 目的地）。
+    Excel出力には使わず、画面表示専用。
+    """
+    if not route_points:
+        return None
+    display_parts = []
+    for name in route_points:
+        if not name:
+            continue
+        if name.lower() == "start":
+            display_parts.append(current_st_name)
+        elif name.lower() == "goal":
+            display_parts.append("目的地")
+        else:
+            # 連続する同名地点は表示しない
+            if not display_parts or display_parts[-1] != name:
+                display_parts.append(name)
+    if not display_parts:
+        return None
+    route_str = " ➔ ".join(display_parts)
+    if display_parts[-1] != "目的地":
+        route_str += " ➔ 目的地"
+    return route_str
+
+
 def guess_airport_from_address(address):
     mapping = [
         (["沖永良部", "知名町", "和泊町"], "沖永良部空港"),
@@ -480,7 +508,10 @@ def search_flight_fare_with_gemini(raw_address, airport_name, gemini_key, origin
     client = genai.Client(api_key=gemini_key.strip())
     origin_city = "大阪" if "淀屋橋" in origin_name else "東京"
     prompt = (
-        "出張旅費算出のためGoogle検索で調査してください。\n\n"
+        "出張旅費算出のためGoogle検索で調査してください。\n"
+        "航空会社は全日空（ANA）に限定し、運賃種別は「ANA FLEX」（フレックス運賃）を"
+        "指定して調べてください。ANA FLEX以外の運賃種別（ANA SUPER VALUE、旅割、"
+        "その他割引運賃等）や、ANA以外の航空会社・LCCの運賃は対象外です。\n\n"
         f"【出発地】: {origin_city}\n"
         f"【到着空港】: {airport_name}\n"
         f"【最終目的地】: {raw_address}\n\n"
@@ -488,7 +519,7 @@ def search_flight_fare_with_gemini(raw_address, airport_name, gemini_key, origin
         '{\n'
         '  "airport_lat": 到着空港の緯度,\n'
         '  "airport_lon": 到着空港の経度,\n'
-        f'  "flight_fare_estimate": {origin_city}から{airport_name}への片道普通運賃(円),\n'
+        f'  "flight_fare_estimate": ANA FLEX運賃での{origin_city}から{airport_name}への片道運賃(円),\n'
         f'  "flight_time_min": {origin_city}から{airport_name}までの片道所要時間(分)\n'
         '}'
     )
@@ -509,6 +540,63 @@ def search_flight_fare_with_gemini(raw_address, airport_name, gemini_key, origin
     finally:
         retry_placeholder.empty()
     return fallback_data
+
+
+def compare_flight_fare_with_gemini(origin_airport, dest_airport, gemini_key):
+    """
+    [追加] NAVITIMEが返した飛行機区間（出発空港→到着空港）について、
+    GeminiでANA FLEX運賃を検索する。比較参考表示専用で、
+    Excelに書き込む金額には影響しない。
+
+    NAVITIME APIには航空会社・運賃種別を指定するパラメータが存在せず、
+    運行会社は「航空各社」として一般的な普通運賃(unit_0)が返るため、
+    ANA FLEX運賃との差分を把握する目的で使用する。
+
+    戻り値: dict | None
+      {"fare": 片道運賃(円), "note": 補足文字列}
+    """
+    if not origin_airport or not dest_airport:
+        return None
+
+    client = genai.Client(api_key=gemini_key.strip())
+    prompt = (
+        "出張旅費算出のためGoogle検索で調査してください。\n"
+        "航空会社は全日空（ANA）に限定し、運賃種別は「ANA FLEX」（フレックス運賃）を"
+        "指定して調べてください。ANA FLEX以外の運賃種別（ANA SUPER VALUE、旅割、"
+        "その他割引運賃等）や、ANA以外の航空会社・LCCの運賃は対象外です。\n"
+        "該当区間にANAの直行便が存在しない場合は、flight_fare に 0 を入れ、"
+        "note にその旨を記載してください。\n\n"
+        f"【出発空港】: {origin_airport}\n"
+        f"【到着空港】: {dest_airport}\n\n"
+        "以下の形式のJSONテキストのみを回答してください。\n"
+        '{\n'
+        '  "flight_fare": ANA FLEX運賃での片道運賃(円・数値のみ),\n'
+        '  "note": "補足（就航状況や運賃の前提など短く）"\n'
+        '}'
+    )
+
+    retry_placeholder = st.empty()
+    try:
+        tool = types.Tool(google_search=types.GoogleSearch())
+        config = types.GenerateContentConfig(tools=[tool], temperature=0.1)
+        text = call_gemini_with_retry(client=client, model=GEMINI_MODEL, contents=prompt,
+                                      config=config, retry_status_placeholder=retry_placeholder)
+        if not text:
+            return None
+        parsed = parse_json_from_text(text)
+        if not parsed:
+            return None
+        fare = parsed.get("flight_fare", 0)
+        try:
+            fare = int(float(fare))
+        except (TypeError, ValueError):
+            return None
+        return {"fare": fare, "note": str(parsed.get("note", ""))}
+    except Exception as e:
+        st.caption(f"（ANA FLEX運賃の比較検索に失敗: {e}）")
+        return None
+    finally:
+        retry_placeholder.empty()
 
 
 def get_navitime_fastest_route(start_lat, start_lon, goal_lat, goal_lon, navitime_key,
@@ -571,6 +659,7 @@ def get_navitime_fastest_route(start_lat, start_lon, goal_lat, goal_lon, navitim
         flight_end_name = None
         post_flight_start_name = None
         post_flight_end_name = None
+        flight_leg_time_min = None
 
         if has_flight:
             for i, sec in enumerate(sections):
@@ -620,6 +709,9 @@ def get_navitime_fastest_route(start_lat, start_lon, goal_lat, goal_lon, navitim
                     flight_end_name = sections[i].get("name")
                     break
 
+            # [追加] 飛行機区間そのものの所要時間（全行程ではなく、その区間のみ）
+            flight_leg_time_min = sections[flight_section_idx].get("time", 0)
+
             found_flight_end = False
             for i in range(flight_section_idx + 1, len(sections)):
                 if sections[i].get("type") == "point":
@@ -635,7 +727,11 @@ def get_navitime_fastest_route(start_lat, start_lon, goal_lat, goal_lon, navitim
 
         else:
             fare_dict = move_info.get("fare", {})
-            reference_fare = fare_dict.get("reference_fare", {}) if isinstance(fare_dict, dict) else {}
+            # [再修正] reference_fare は fare オブジェクトの「中」ではなく、
+            # move_info（区間サマリ）直下に fare と並列で入っている。
+            # 旧コードは fare_dict.get("reference_fare") としており常に空を返し、
+            # 意図せずフォールバック(unit_0+unit_1)にしか到達できていなかった。
+            reference_fare = move_info.get("reference_fare", {})
 
             # [修正] NAVITIME自身が算出した合計運賃(reference_fare)を最優先で使う。
             # これが最も信頼できる「実際に乗車した場合の合計運賃」。
@@ -692,6 +788,7 @@ def get_navitime_fastest_route(start_lat, start_lon, goal_lat, goal_lon, navitim
             "post_flight_start": post_flight_start_name,
             "post_flight_end": post_flight_end_name or end_station_name,
             "route_points": route_points,
+            "flight_time_min": flight_leg_time_min,
         }
 
         if DEBUG_MODE:
@@ -743,7 +840,10 @@ def build_best_route_patterns(current_st_name, ai_info, navitime_route,
             post_end = navitime_route.get("post_flight_end") or end_st
 
             route_title = f"✈️ 飛行機ルート ({dest_airport}経由)"
-            display_route_str = f"{current_st_name} ➔ {origin_airport} ➔ {dest_airport} ➔ {end_st} ➔ 目的地"
+            display_route_str = (
+                build_detailed_route_string(navitime_route.get("route_points"), current_st_name)
+                or f"{current_st_name} ➔ {origin_airport} ➔ {dest_airport} ➔ {end_st} ➔ 目的地"
+            )
 
             # 行9=「電車・新幹線（往復）」＝出発駅→出発空港（pre_flight）
             # 行10=「飛行機（往復）」
@@ -770,7 +870,9 @@ def build_best_route_patterns(current_st_name, ai_info, navitime_route,
                     "from": origin_airport,
                     "to": dest_airport,
                     "fare": flight_fare * 2,
-                    "time_h": time_hours if (time_hours := round(time_min / 60.0, 1)) else "",
+                    # [修正] 全行程の所要時間ではなく、飛行機区間のみの所要時間を使う
+                    "time_h": (round(navitime_route["flight_time_min"] / 60.0, 1)
+                               if navitime_route.get("flight_time_min") else ""),
                 },
                 "access": {
                     "used": post_flight_fare > 0,
@@ -785,7 +887,10 @@ def build_best_route_patterns(current_st_name, ai_info, navitime_route,
             end_st = navitime_route["end_station"]
             total_fare = navitime_route["total_fare"]
             route_title = f"🚄 電車ルート ({end_st}着)"
-            display_route_str = f"{current_st_name} ➔ {end_st} ➔ 目的地"
+            display_route_str = (
+                build_detailed_route_string(navitime_route.get("route_points"), current_st_name)
+                or f"{current_st_name} ➔ {end_st} ➔ 目的地"
+            )
 
             # [修正] total_fare はNAVITIMEの片道検索結果（片道運賃）。
             # 行9「電車・新幹線（往復）」に書き込むため、明示的に2倍して往復運賃にする。
@@ -818,7 +923,7 @@ def build_best_route_patterns(current_st_name, ai_info, navitime_route,
         end_st = airport_name
         base_taxi_km = airport_to_dest_km
 
-        route_title = f"✈️ 飛行機ルート ({airport_name}利用)"
+        route_title = f"✈️ 飛行機ルート ({airport_name}利用・ANA FLEX想定)"
         display_route_str = f"{current_st_name} ➔ {origin_airport} ➔ {airport_name} ➔ 目的地"
 
         # [修正] flight_fare / access_fare も片道相当の値なので、
@@ -861,7 +966,12 @@ def build_best_route_patterns(current_st_name, ai_info, navitime_route,
     rental_days = work_days + (1 if "前泊" in stay_note else 0)
     rental_car_total = round_up_1000(RENTAL_CAR_COST_PER_DAY * rental_days)
     taxi_one_way = base_taxi_km * TAXI_FARE_PER_KM
-    taxi_trips = nights + 1
+    # [修正] タクシー回数は、Excelテンプレート側のO13セルの数式(=C5+C6、
+    # 作業日数+長距離移動フラグ)と一致させる。旧コード(nights+1)は
+    # 別の計算根拠だったため、画面の内訳とダウンロードしたExcelの
+    # タクシー代・合計金額が食い違う原因になっていた。
+    extra_travel_day = 1 if (selected_mode == "flight" or travel_hours >= 4.0) else 0
+    taxi_trips = work_days + extra_travel_day
     taxi_total = round_up_1000(taxi_one_way * 2 * taxi_trips)
 
     base_transport = {}
@@ -935,12 +1045,23 @@ def build_best_route_patterns(current_st_name, ai_info, navitime_route,
     if is_ai_fare:
         recommend_msg += " / AI相場(1.3倍マージン)"
 
+    # [追加] ANA FLEX運賃との比較表示用の情報（飛行機を使うルートのみ）
+    flight_compare_info = None
+    if selected_mode == "flight":
+        flight_compare_info = {
+            "origin_airport": origin_airport,
+            "dest_airport": dest_airport if navitime_route else airport_name,
+            # NAVITIME由来の片道運賃。navitime_routeが無い場合はAI推定値なので比較対象外
+            "navitime_fare": flight_fare if navitime_route else None,
+        }
+
     patterns.append({
         "type": final_type, "name": final_name, "time_min": time_min,
         "cost": final_cost, "breakdown": final_breakdown, "note": stay_note,
         "routes": {}, "display_route": display_route_str,
         "recommend_reason": recommend_msg, "is_recommended": True,
         "excel_data": excel_data,
+        "flight_compare": flight_compare_info,
     })
     return patterns
 
@@ -1007,6 +1128,14 @@ with col_c3:
 with col_c4:
     no_taxi = st.checkbox("タクシーを使用しない", value=False)
 
+compare_ana_flex = st.checkbox(
+    "航空運賃をANA FLEXと比較する（参考表示のみ・処理時間が増えます）",
+    value=False,
+    help="NAVITIMEは航空会社を指定できず「航空各社」の普通運賃を返します。"
+         "ONにするとGoogle検索でANA FLEX運賃を調べ、差額を画面に表示します。"
+         "Excelに出力される金額はNAVITIMEの値のままです。",
+)
+
 st.markdown("---")
 
 if st.button("見積もりを計算する", type="primary"):
@@ -1067,11 +1196,33 @@ if st.button("見積もりを計算する", type="primary"):
             with st.expander(f"{p['name']} — 合計 {p['cost']:,} 円", expanded=p["is_recommended"]):
                 st.success(p['recommend_reason'])
                 st.write(f"**ルート:** {p['display_route']}")
+                st.caption("※乗り換え駅・空港を含む詳細ルート（Excelには反映されません）")
                 st.write(f"**片道:** 約 {p['time_min']} 分")
                 st.write(f"**宿泊:** {p['note']}")
                 st.write("**内訳:**")
                 for item, amt in p["breakdown"].items():
                     st.write(f"　・{item}: **{amt:,}** 円")
+
+                # [追加] ANA FLEX運賃との比較（チェックON時のみ・参考表示）
+                _cmp = p.get("flight_compare")
+                if compare_ana_flex and _cmp and _cmp.get("navitime_fare"):
+                    _nav_fare = _cmp["navitime_fare"]
+                    with st.spinner("ANA FLEX運賃を検索中..."):
+                        _gem = compare_flight_fare_with_gemini(
+                            _cmp["origin_airport"], _cmp["dest_airport"], gemini_api_key)
+                    st.markdown("**航空運賃の比較（片道・1人分／参考）**")
+                    if not _gem or not _gem.get("fare"):
+                        st.caption("・ANA FLEX運賃を取得できませんでした。")
+                    else:
+                        _gem_fare = _gem["fare"]
+                        _diff = _gem_fare - _nav_fare
+                        _ratio = (_gem_fare / _nav_fare) if _nav_fare else 0
+                        st.write(f"　・NAVITIME（航空各社・普通運賃）: **{_nav_fare:,}** 円")
+                        st.write(f"　・Gemini検索（ANA FLEX）: **{_gem_fare:,}** 円")
+                        st.write(f"　・差額: **{_diff:+,}** 円（NAVITIME比 {_ratio:.2f} 倍）")
+                        if _gem.get("note"):
+                            st.caption(f"・補足: {_gem['note']}")
+                    st.caption("※比較は参考表示です。Excelに出力されるのはNAVITIMEの金額です。")
 
                 if DEBUG_MODE:
                     with st.expander("🔍 [DEBUG] excel_data", expanded=False):
