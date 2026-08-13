@@ -45,7 +45,11 @@ STATION_COORDS = {
 HOTEL_COST_PER_NIGHT_PER_PERSON = 20_000
 RENTAL_CAR_COST_PER_DAY = 12_000
 TAXI_FARE_PER_KM = 400
-TAXI_WALK_THRESHOLD_MIN = 15
+# 最寄り駅から目的地まで徒歩でこの時間を超える場合はタクシー/レンタカーを使う想定
+TAXI_WALK_THRESHOLD_MIN = 5
+# 上記の徒歩時間に相当する距離(km)。不動産表記の分速80mで換算（5分 = 約0.4km）。
+# 駅・目的地の座標が取れている場合はこちらの距離基準で判定する。
+TAXI_WALK_THRESHOLD_KM = 0.4
 
 NAVITIME_URL = "https://navitime-route-totalnavi.p.rapidapi.com/route_transit"
 NAVITIME_HOST = "navitime-route-totalnavi.p.rapidapi.com"
@@ -442,11 +446,27 @@ def create_excel_report(pattern_data, address, headcount, work_days, origin_stat
 # ============================================================
 
 def geocode_fallback(address):
+    """
+    国土地理院(GSI)の住所検索APIで住所→緯度経度を取得する。
+    番地まで含む住所ほど精度が高い。取得できない場合は (None, None)。
+    """
+    if not address:
+        return None, None
     try:
-        res = requests.get(GSI_GEOCODE_URL, params={"q": address}, timeout=5)
-        if res.status_code == 200 and res.json():
-            lon, lat = res.json()[0]["geometry"]["coordinates"]
-            return lat, lon
+        res = requests.get(GSI_GEOCODE_URL, params={"q": address}, timeout=8)
+        if res.status_code != 200:
+            return None, None
+        results = res.json()
+        if not results:
+            return None, None
+        # GSIは複数候補を返すことがあり、先頭が最も一致度の高い候補。
+        # ただし座標が欠けている候補もあるため、有効な座標を持つ最初の候補を採用する。
+        for item in results:
+            coords = item.get("geometry", {}).get("coordinates")
+            if coords and len(coords) >= 2:
+                lon, lat = coords[0], coords[1]
+                if lat and lon:
+                    return lat, lon
     except Exception:
         pass
     return None, None
@@ -491,10 +511,37 @@ def analyze_destination_with_gemini(raw_address, gemini_key, origin_name):
     finally:
         retry_placeholder.empty()
 
-    if not fallback_data.get("dest_lat") or not fallback_data.get("dest_lon"):
-        lat, lon = geocode_fallback(fallback_data["normalized_address"])
-        fallback_data["dest_lat"] = lat
-        fallback_data["dest_lon"] = lon
+    # [修正] 座標は国土地理院(GSI)の住所検索を最優先で使う。
+    # Geminiは住所の緯度経度を「知識」で答えるため、番地レベルの精度が無く、
+    # 市町村中心や最寄り駅付近の座標を返してしまうことがある。
+    # （実例: 高知県須崎市緑町4-30 で須崎駅から0.3km地点の座標を返し、
+    #  実際は駅から2.6km離れているのにタクシー代が計上されなかった）
+    # GSIで取得できなかった場合のみ、Geminiの推定座標にフォールバックする。
+    gemini_lat = fallback_data.get("dest_lat")
+    gemini_lon = fallback_data.get("dest_lon")
+    coord_source = "gemini"
+
+    gsi_lat, gsi_lon = geocode_fallback(fallback_data["normalized_address"])
+    if not gsi_lat or not gsi_lon:
+        # 正規化した住所で引けなければ、入力された生の住所でも試す
+        gsi_lat, gsi_lon = geocode_fallback(raw_address)
+
+    if gsi_lat and gsi_lon:
+        fallback_data["dest_lat"] = gsi_lat
+        fallback_data["dest_lon"] = gsi_lon
+        coord_source = "gsi"
+    elif gemini_lat and gemini_lon:
+        fallback_data["dest_lat"] = gemini_lat
+        fallback_data["dest_lon"] = gemini_lon
+        coord_source = "gemini"
+
+    fallback_data["coord_source"] = coord_source
+    # 参考: 両者の座標がどれくらいズレているかを記録（デバッグ表示用）
+    if gsi_lat and gsi_lon and gemini_lat and gemini_lon:
+        fallback_data["coord_gap_km"] = round(
+            haversine_km(gsi_lat, gsi_lon, gemini_lat, gemini_lon), 2)
+        fallback_data["gemini_lat"] = gemini_lat
+        fallback_data["gemini_lon"] = gemini_lon
 
     if fallback_data.get("is_island_or_remote"):
         guessed = guess_airport_from_address(fallback_data["normalized_address"])
@@ -822,9 +869,14 @@ def build_best_route_patterns(current_st_name, ai_info, navitime_route,
         e_lat, e_lon = navitime_route.get("end_station_lat"), navitime_route.get("end_station_lon")
 
         if e_lat and e_lon and dest_lat and dest_lon:
+            # 直線距離に1.3倍の道なり係数をかけて実距離を推定
             base_taxi_km = haversine_km(e_lat, e_lon, dest_lat, dest_lon) * 1.3
-            base_taxi_km = 0.0 if base_taxi_km <= 1.2 else max(base_taxi_km, 1.5)
+            # [修正] 閾値を徒歩15分相当(1.2km)から徒歩5分相当(0.4km)に変更。
+            # 閾値以下なら徒歩、超える場合はタクシー/レンタカー利用とする。
+            base_taxi_km = (0.0 if base_taxi_km <= TAXI_WALK_THRESHOLD_KM
+                            else max(base_taxi_km, 1.5))
         else:
+            # 座標が取れない場合は最終区間の徒歩時間で判定
             base_taxi_km = (0.0 if navitime_route["last_walk_min"] <= TAXI_WALK_THRESHOLD_MIN
                             else max(navitime_route["last_walk_min"] * 0.08, 1.5))
 
@@ -1055,6 +1107,14 @@ def build_best_route_patterns(current_st_name, ai_info, navitime_route,
             "navitime_fare": flight_fare if navitime_route else None,
         }
 
+    # [追加] 最寄り駅から目的地までの距離と、徒歩/車の判定根拠（画面表示用）
+    _walk_min_est = int(round(base_taxi_km / 1.3 / 0.08)) if base_taxi_km else 0
+    last_leg_info = {
+        "km": round(base_taxi_km, 2),
+        "walk_min": _walk_min_est,
+        "use_vehicle": base_taxi_km > 0,
+    }
+
     patterns.append({
         "type": final_type, "name": final_name, "time_min": time_min,
         "cost": final_cost, "breakdown": final_breakdown, "note": stay_note,
@@ -1062,6 +1122,7 @@ def build_best_route_patterns(current_st_name, ai_info, navitime_route,
         "recommend_reason": recommend_msg, "is_recommended": True,
         "excel_data": excel_data,
         "flight_compare": flight_compare_info,
+        "last_leg": last_leg_info,
     })
     return patterns
 
@@ -1161,6 +1222,20 @@ if st.button("見積もりを計算する", type="primary"):
 
         st.success(f"検索地点: {ai_info.get('normalized_address', address_input)}")
 
+        # [追加] どの座標源を使ったかを表示。GSI(国土地理院)が最も精度が高い。
+        _src = ai_info.get("coord_source")
+        if _src == "gsi":
+            _gap = ai_info.get("coord_gap_km")
+            _msg = "座標: 国土地理院の住所検索を使用"
+            if _gap is not None and _gap >= 0.5:
+                _msg += f"（AI推定座標とは {_gap} km のズレがあったため、こちらを採用）"
+            st.caption(_msg)
+        elif _src == "gemini":
+            st.caption(
+                "⚠️ 座標: 国土地理院で住所を特定できず、AI推定座標を使用しています。"
+                "駅からの距離・タクシー代の精度が落ちる可能性があります。"
+            )
+
         if DEBUG_MODE:
             with st.expander("🔍 [DEBUG] Gemini結果", expanded=False):
                 st.json(ai_info)
@@ -1199,6 +1274,25 @@ if st.button("見積もりを計算する", type="primary"):
                 st.caption("※乗り換え駅・空港を含む詳細ルート（Excelには反映されません）")
                 st.write(f"**片道:** 約 {p['time_min']} 分")
                 st.write(f"**宿泊:** {p['note']}")
+
+                _leg = p.get("last_leg")
+                if _leg:
+                    if _leg["use_vehicle"]:
+                        st.write(
+                            f"**最寄り駅から:** 約 {_leg['km']} km（徒歩約 {_leg['walk_min']} 分）"
+                            f" → 徒歩{TAXI_WALK_THRESHOLD_MIN}分超のため車移動を計上"
+                        )
+                    else:
+                        st.write(
+                            f"**最寄り駅から:** 約 {_leg['km']} km"
+                            f"（徒歩{TAXI_WALK_THRESHOLD_MIN}分以内のため徒歩移動）"
+                        )
+                        if ai_info.get("coord_source") != "gsi":
+                            st.warning(
+                                "目的地の座標がAI推定のため、駅からの距離が実際より"
+                                "短く出ている可能性があります。地図で実際の距離を確認し、"
+                                "徒歩5分を超える場合は手動でタクシー代を追加してください。"
+                            )
                 st.write("**内訳:**")
                 for item, amt in p["breakdown"].items():
                     st.write(f"　・{item}: **{amt:,}** 円")
